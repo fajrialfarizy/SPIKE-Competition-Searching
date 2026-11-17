@@ -1,0 +1,33 @@
+# PRD TRACEABILITY MATRIX
+## Instagram Competition Monitoring & Curation System
+
+Statuses are exactly one of: `Passed (automated, mocked)`, `Not tested (needs real services)`, `Failed`.
+See `docs/TEST_REPORT.md` for the test names behind each row.
+
+| PRD / Requirement | Topic | Implementation | Test status |
+|---|---|---|---|
+| 1.3 | 5 competition types | `compmon/normalization.py` (`normalize_competition_type`) | Passed (automated, mocked) |
+| 1.4 | Eligibility rules | `compmon/eligibility.py` | Passed (automated, mocked) |
+| 2.1 | Python + Apify + Gemini + Sheets stack | `compmon/`, `requirements.txt` (all pinned) | Passed (automated, mocked) |
+| 4.1 | Competition Report: 15 columns, append-only, column D never written, RAW writes | `compmon/sheets_repo.py`, `templates/build_template.py` | Passed (automated, mocked) |
+| 4.1 | Grade ARRAYFORMULA (generic rules, non-empty aliases, blank/Unknown, Hybrid=Offline) | `templates/build_template.py` | Passed (automated, mocked) — formula structure and the Python oracle; live sheet evaluation is `Not tested (needs real services)` |
+| 4.1 | Status dropdown, Post ID text format, protected ranges (full sheet, warning-only, idempotent) | `templates/build_template.py` | Passed (automated, mocked); live Google API behaviour is `Not tested (needs real services)` |
+| 4.2 | System Log: 13 columns, one row per Post ID, RAW, retry de-dup | `compmon/sheets_repo.py` (`append_raw_posts_to_system_log`) | Passed (automated, mocked) |
+| 4.3 | Execution Log row per run, EXE-… id, Success/Partial/Failed | `compmon/exec_log.py`, `compmon/pipeline.py` | Passed (automated, mocked) |
+| 5.x | Config / Run State / Master data / Rules sheets | `compmon/config.py`, `templates/build_template.py` | Passed (automated, mocked) |
+| 6.1 | Initial scraping: source selection, 60/30/30 day ranges, pagination, unfinished ranges | `compmon/pipeline.py` (`run_initial_scraping`) | Passed (automated, mocked); live Apify is `Not tested (needs real services)` |
+| 6.2 | Routine scraping: checkpoint guard, due keywords, pending first | `compmon/pipeline.py` (`run_routine_scraping`) | Passed (automated, mocked); live Apify is `Not tested (needs real services)` |
+| 6.3–6.4 | Post ID / URL / timestamp validation | `compmon/validator.py` | Passed (automated, mocked) |
+| 6.5 | Hard limits: ≤100 new posts per run, 20-result step with a 200 ceiling, sequential Gemini with 6 s delay, ≤3 retries | `compmon/quota.py`, `compmon/pipeline.py`, `compmon/config.py` | Passed (automated, mocked) |
+| 7.1–7.3 | Gemini extraction, schema, anti-hallucination URLs, strict dates, permanent-error halt | `compmon/gemini_extractor.py` | Passed (automated, mocked); live Gemini is `Not tested (needs real services)` |
+| 7.4–7.5 | Deadline yesterday/today/tomorrow, missing criteria → Unknown | `compmon/eligibility.py` | Passed (automated, mocked) |
+| 8.1–8.5 | Grade rules (Advance/Professional/Intermediate/Beginner) | `compmon/grading_support.py`, `templates/build_template.py` | Passed (automated, mocked); live formula parity `Not tested (needs real services)` |
+| 9.1 | Post-level de-duplication & attribution merge | `compmon/dedup.py` | Passed (automated, mocked) |
+| 9.2 | 4-attribute matching, D2 deadline-diff note, D3 both-empty note | `compmon/matcher.py` | Passed (automated, mocked) |
+| 9.3 | Admin rows never overwritten, gap-safe row targeting, ID assignment | `compmon/sheets_repo.py` | Passed (automated, mocked) |
+| 10.1 | Candidate keyword discovery (n-grams, sub-phrase removal) | `compmon/keyword_eval.py` | Passed (automated, mocked) |
+| 10.2–10.3 | Cumulative relevance evaluation with configurable thresholds | `compmon/keyword_eval.py` | Passed (automated, mocked) |
+| 11 | Notebook 03 writes metrics/candidates, one Execution Log row, never activates/deletes | `compmon/keyword_eval.py` (`run_keyword_evaluation`), `notebooks/03_keyword_evaluation.ipynb` | Passed (automated, mocked) |
+| 12.1–12.4 | Retry/backoff, pending-range recovery, interrupted-run safety | `compmon/pipeline.py`, `docs/ERROR_HANDLING_RECOVERY.md` | Passed (automated, mocked) |
+| 13 | Admin workflow guide | `docs/ADMIN_GUIDE.md` | Documentation only |
+| 14 | Credentials from Colab Secrets, never logged | `docs/CREDENTIALS.md`, notebooks | Documentation only; live Colab auth is `Not tested (needs real services)` |

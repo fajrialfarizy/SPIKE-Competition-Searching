@@ -1,0 +1,9 @@
+# Runtime dependencies. Every version is pinned; notebooks install this file with
+# `!pip install -q -r requirements.txt`.
+google-genai==1.2.0
+apify-client==1.8.1
+gspread==6.1.4
+google-auth==2.38.0
+google-auth-oauthlib==1.2.1
+pydantic==2.10.6
+python-dateutil==2.9.0.post0
