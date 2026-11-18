@@ -197,7 +197,7 @@ class PipelineTestCase(unittest.TestCase):
 class TestAccountPagination(PipelineTestCase):
 
     def test_account_with_more_than_one_page_reaches_success(self):
-        """Task 23: 45 posts with a 20-post step must be fully covered -> Success."""
+        """Task 23 + Fix 8: 45 posts, first run 20 (saturated) then one run at the ceiling."""
         posts = [make_post(f"acct_post_{i:03d}", days_ago=i + 1, account="lombabisnis")
                  for i in range(45)]
         apify = WindowApify({"lombabisnis": posts})
@@ -218,7 +218,8 @@ class TestAccountPagination(PipelineTestCase):
         self.assertEqual(summary["status"], "Success")
         self.assertEqual(summary["new_posts"], 45)
         self.assertEqual(len(repo.load_system_log_index()), 45)
-        self.assertEqual([limit for _, limit in apify.account_calls], [20, 40, 60])
+        # Fix 8: no 20/40/60 stepping - the saturated first run jumps to the ceiling.
+        self.assertEqual([limit for _, limit in apify.account_calls], [20, 200])
 
         state = repo.load_run_state()
         self.assertTrue(state["global_checkpoint"])
@@ -283,14 +284,104 @@ class TestAccountPagination(PipelineTestCase):
 
         self.assertEqual(summary["status"], "Partial")
         self.assertEqual(len(repo.load_system_log_index()), 40)
+        # Fix 8: at most two runs (start limit, then the ceiling), never 20/40/60...
+        self.assertEqual([limit for _, limit in apify.account_calls], [20, 40])
         state = repo.load_run_state()
         pending = parse_pending_ranges(state["pending_ranges"])
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0].source, "lombabisnis")
-        self.assertIn("max_results_ceiling_per_source=40", pending[0].reason)
+        self.assertIn("ceiling=40", pending[0].reason)
+        self.assertIn("max_results_ceiling_per_source", pending[0].reason)
         # D18 (d): this run had a single source and it did not finish (ceiling reached, so
         # `completed_sources == 0`), which counts as an outage for the checkpoint rule.
         self.assertEqual(state["global_checkpoint"], "")
+
+
+class TestApifyCostControl(PipelineTestCase):
+    """Fix 8: two runs per source at most, and no re-scrape of a source stuck at the ceiling."""
+
+    def test_saturated_first_run_makes_exactly_one_more_request_at_the_ceiling(self):
+        posts = [make_post(f"big_{i:03d}", days_ago=(i % 55) + 1, account="lombabisnis")
+                 for i in range(150)]
+        apify = WindowApify({"lombabisnis": posts})
+        client, repo, pipeline = self.build(apify, self.success_gemini)
+        pipeline.config.max_new_posts_per_run = 500
+        pipeline.config.max_results_per_input = 20
+        pipeline.config.max_results_ceiling_per_source = 300
+        pipeline.config.account_start_limit_initial = 100
+
+        summary = pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+
+        # 100 was saturated, so the second (and last) request goes straight to 300.
+        self.assertEqual([limit for _, limit in apify.account_calls], [100, 300])
+        self.assertEqual(summary["new_posts"], 150)
+        self.assertEqual(summary["status"], "Success")
+        self.assertEqual(parse_pending_ranges(repo.load_run_state()["pending_ranges"]), [])
+
+    def test_ceiling_entry_is_not_rescraped_until_the_ceiling_is_raised(self):
+        posts = [make_post(f"stuck_{i:03d}", days_ago=i + 1, account="lombabisnis")
+                 for i in range(60)]
+        apify = WindowApify({"lombabisnis": posts})
+        client, repo, pipeline = self.build(apify, self.success_gemini)
+        pipeline.config.max_results_per_input = 20
+        pipeline.config.max_results_ceiling_per_source = 40
+
+        first = pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+        self.assertEqual(first["status"], "Partial")
+        self.assertEqual([limit for _, limit in apify.account_calls], [20, 40])
+        self.assertEqual(repo.load_run_state()["global_checkpoint"], "")
+
+        apify.account_calls.clear()
+        second = pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+
+        # No Apify credit is spent on the same truncated window ...
+        self.assertEqual(apify.account_calls, [])
+        # ... the entry is kept so the work is still visible ...
+        pending = parse_pending_ranges(repo.load_run_state()["pending_ranges"])
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].source, "lombabisnis")
+        self.assertIn("ceiling=40", pending[0].reason)
+        # ... the Execution Log explains how to unblock it ...
+        notes = repo.get_worksheet("Execution Log").data[-1][10]
+        self.assertIn(
+            "ceiling reached for lombabisnis, raise max_results_ceiling_per_source in Config",
+            notes,
+        )
+        self.assertEqual(second["status"], "Partial")
+        # ... and it must not hold the checkpoint behind (D18).
+        self.assertTrue(repo.load_run_state()["global_checkpoint"])
+
+    def test_raising_the_ceiling_runs_the_source_first_and_clears_the_entry(self):
+        posts = [make_post(f"raise_{i:03d}", days_ago=i + 1, account="lombabisnis")
+                 for i in range(60)]
+        apify = WindowApify({"lombabisnis": posts})
+        client, repo, pipeline = self.build(apify, self.success_gemini)
+        pipeline.config.max_results_per_input = 20
+        pipeline.config.max_results_ceiling_per_source = 40
+
+        pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+        self.assertEqual(len(parse_pending_ranges(repo.load_run_state()["pending_ranges"])), 1)
+
+        apify.account_calls.clear()
+        pipeline.config.max_results_ceiling_per_source = 80
+        summary = pipeline.run_initial_scraping(
+            selected_accounts=["acc_b", "lombabisnis"], selected_keywords=[]
+        )
+
+        self.assertEqual(apify.account_calls[0][0], "lombabisnis")
+        self.assertEqual([limit for acc, limit in apify.account_calls
+                          if acc == "lombabisnis"], [20, 80])
+        self.assertEqual(parse_pending_ranges(repo.load_run_state()["pending_ranges"]), [])
+        self.assertEqual(summary["status"], "Success")
+        self.assertTrue(repo.load_run_state()["global_checkpoint"])
 
 
 class TestKeywordPagination(PipelineTestCase):
@@ -336,7 +427,7 @@ class TestKeywordPagination(PipelineTestCase):
         self.assertEqual(summary["status"], "Partial")
         pending = parse_pending_ranges(repo.load_run_state()["pending_ranges"])
         self.assertEqual(len(pending), 1)
-        self.assertIn("max_results_ceiling_per_source=4", pending[0].reason)
+        self.assertIn("ceiling=4", pending[0].reason)
         self.assertEqual(len(repo.load_system_log_index()), 4)
 
 
@@ -810,7 +901,7 @@ class TestRawCountPagination(PipelineTestCase):
             selected_accounts=["lombabisnis"], selected_keywords=[]
         )
 
-        self.assertEqual([limit for _, limit in apify.account_calls], [20, 40])
+        self.assertEqual([limit for _, limit in apify.account_calls], [20, 200])
         self.assertEqual(summary["new_posts"], 18)
         self.assertEqual(len(repo.load_system_log_index()), 18)
         self.assertEqual(summary["status"], "Success")
@@ -1051,6 +1142,8 @@ class TestCheckpointD18(PipelineTestCase):
 
         apify.account_calls.clear()
         apify.account_cutoffs.clear()
+        # Fix 8: the entry is only scraped again once the owner raises the ceiling.
+        pipeline.config.max_results_ceiling_per_source = 60
         pipeline.run_initial_scraping(
             selected_accounts=["lombabisnis"], selected_keywords=[]
         )

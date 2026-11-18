@@ -21,6 +21,10 @@ Key guarantees:
   dead (not processed, no cap budget, no `failed_posts`, no `Partial`).
 - D18: `global_checkpoint` records scraping coverage (run start time, UTC), so extraction
   failures and cap-deferred posts no longer force a re-scrape of the whole window.
+- Fix 8 (cost control): the FIRST saturated account run jumps straight to
+  `max_results_ceiling_per_source` instead of stepping by `max_results_per_input`, so a
+  source costs at most 2 actor runs; a pending entry that already reached the ceiling
+  (`ceiling=<value>` in its reason) is not re-scraped until the owner raises the ceiling.
 """
 
 import logging
@@ -44,7 +48,7 @@ from compmon.matcher import match_competition_record
 from compmon.eligibility import evaluate_eligibility_and_deadline
 from compmon.checkpoint import (
     parse_pending_ranges, serialize_pending_ranges, checkpoint_should_advance,
-    merge_pending_ranges, group_pending_by_source, _pending_key
+    merge_pending_ranges, group_pending_by_source, _pending_key, recorded_ceiling
 )
 from compmon.retry_policy import parse_attempts, next_attempt, set_attempts, is_dead
 from compmon.exec_log import generate_execution_id, format_iso_wib, determine_execution_status
@@ -138,8 +142,10 @@ class CompetitionPipeline:
         )
 
     def _ceiling_reason(self, source_label: str, ceiling: int) -> str:
+        # Fix 8: the "ceiling=<value>" marker lets the next run skip this source until the
+        # owner raises `max_results_ceiling_per_source` above that value.
         return (
-            f"Reached max_results_ceiling_per_source={ceiling} for {source_label}; "
+            f"ceiling={ceiling}: reached max_results_ceiling_per_source for {source_label}; "
             f"the source may still have more posts in this range."
         )
 
@@ -176,15 +182,20 @@ class CompetitionPipeline:
         start_limit: Optional[int] = None,
     ) -> Tuple[List[RawPost], bool, str]:
         """
-        Scrapes one account, escalating `resultsLimit` by `max_results_per_input` until the
-        actor returns fewer RAW items than requested (source exhausted) or the configured
-        ceiling is reached (Task 23). The actor has no upper date bound, so the date cut-off
-        is re-applied in Python by the Apify client and duplicates are collapsed by Post ID.
+        Scrapes one account, raising `resultsLimit` until the actor returns fewer RAW items
+        than requested (source exhausted) or the configured ceiling is reached (Task 23).
+        The actor has no upper date bound, so the date cut-off is re-applied in Python by the
+        Apify client and duplicates are collapsed by Post ID.
 
         `start_limit` is the FIRST `resultsLimit` (default `max_results_per_input`, i.e. the
         historical behaviour); it is clamped to the ceiling. Fix 3: completeness is decided
         from the raw item count, never from the post-date-filter count, so pinned old posts
         cannot make a saturated run look exhausted.
+
+        Fix 8: escalation is a single jump to the ceiling. Measured cost per returned item
+        grows with depth ($0.00162/item at 20, $0.00243/item at 100) and every step re-scrapes
+        from the start, so 20/40/60/... is the expensive path; a source now costs at most two
+        actor runs (start limit, then the ceiling).
 
         Returns (posts, is_done, reason).
         """
@@ -219,12 +230,12 @@ class CompetitionPipeline:
             if raw_count < current_limit:
                 return all_posts, True, ""
 
-            next_limit = current_limit + step
-            if next_limit > ceiling:
+            # Saturated: jump straight to the ceiling instead of adding another step.
+            if current_limit >= ceiling:
                 logger.warning(f"Account '{acc}' reached pagination ceiling {ceiling}")
                 return all_posts, False, self._ceiling_reason(f"account '{acc}'", ceiling)
 
-            current_limit = next_limit
+            current_limit = ceiling
 
     def _query_keyword_window(
         self,
@@ -359,6 +370,11 @@ class CompetitionPipeline:
         - then the normal account/keyword sources, skipping any source already covered by a
           pending entry in this same run,
         - stops starting new sources once the per-run new-post cap is reached.
+
+        Fix 8: a pending entry whose reason records a ceiling that is still in force
+        (`ceiling=<value>` with `value >= max_results_ceiling_per_source`) is NOT scraped: it
+        would burn credits on the same truncated window. The entry stays in `pending_ranges`
+        and is reported in the Execution Log notes until the owner raises the ceiling.
         """
         safety = ExecutionSafetyTracker(self.config.max_new_posts_per_run)
 
@@ -367,16 +383,26 @@ class CompetitionPipeline:
             normal_cutoffs[("Keyword", kw)] = cutoff
 
         pending_by_source = group_pending_by_source(existing_pending)
+        ceiling = self.config.max_results_ceiling_per_source
 
         # (source_type, source, from_date, pending_keys)
         tasks: List[Tuple[str, str, str, List[Tuple[str, str, str, str]]]] = []
         completed_pending_keys: Set[Tuple[str, str, str, str]] = set()
+        ceiling_skipped: List[Tuple[str, str]] = []
         for (stype, source), prs in pending_by_source.items():
             if stype not in ("Account", "Keyword"):
                 # Leftovers from older versions (e.g. "AI"/"System" entries) can never be
                 # scraped; drop them instead of forcing every future run to be Partial.
                 logger.warning(f"Dropping unsupported pending source type '{stype}' ({source})")
                 completed_pending_keys.update(_pending_key(pr) for pr in prs)
+                continue
+            was_blocked_at = recorded_ceiling(prs)
+            if was_blocked_at is not None and was_blocked_at >= ceiling:
+                logger.warning(
+                    f"Skipping {stype.lower()} '{source}': it reached ceiling "
+                    f"{was_blocked_at} and max_results_ceiling_per_source is still {ceiling}"
+                )
+                ceiling_skipped.append((stype, source))
                 continue
             dates = [pr.from_date for pr in prs if pr.from_date]
             earliest = min(dates) if dates else normal_cutoffs.get((stype, source), "")
@@ -448,6 +474,7 @@ class CompetitionPipeline:
             "completed_source_keys": completed_source_keys,
             "safety": safety,
             "budget_blocked": budget_blocked,
+            "ceiling_skipped": ceiling_skipped,
         }
 
     # =========================================================================
@@ -536,6 +563,7 @@ class CompetitionPipeline:
                 dropped_pending_entries=pending_merge.dropped_entries,
                 attempted_sources=scrape["attempted_sources"],
                 completed_source_keys=scrape["completed_source_keys"],
+                ceiling_skipped_sources=scrape["ceiling_skipped"],
             )
 
         except Exception as fatal_e:
@@ -663,6 +691,7 @@ class CompetitionPipeline:
                 dropped_pending_entries=pending_merge.dropped_entries,
                 attempted_sources=scrape["attempted_sources"],
                 completed_source_keys=scrape["completed_source_keys"],
+                ceiling_skipped_sources=scrape["ceiling_skipped"],
             )
 
         except Exception as fatal_e:
@@ -737,6 +766,7 @@ class CompetitionPipeline:
         dropped_pending_entries: int = 0,
         attempted_sources: Optional[List[Tuple[str, str]]] = None,
         completed_source_keys: Optional[Set[Tuple[str, str]]] = None,
+        ceiling_skipped_sources: Optional[List[Tuple[str, str]]] = None,
     ) -> Dict[str, Any]:
         """Core data ingestion, persistence, AI extraction, and matching pipeline."""
         deduped = deduplicate_post_batch(scraped_posts)
@@ -954,6 +984,10 @@ class CompetitionPipeline:
         notes: List[str] = []
         if pending_ranges:
             notes.append(f"Pending ranges: {len(pending_ranges)}")
+        for _stype, source in ceiling_skipped_sources or []:
+            notes.append(
+                f"ceiling reached for {source}, raise max_results_ceiling_per_source in Config"
+            )
         if halted:
             notes.append("Dihentikan karena error permanen Gemini")
         if dead_count:

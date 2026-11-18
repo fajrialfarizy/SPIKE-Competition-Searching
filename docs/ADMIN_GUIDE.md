@@ -8,15 +8,28 @@ Dokumen ini merupakan panduan operasional lengkap bagi admin non-teknis sesuai d
 ### 1. Cara Mengisi & Mengubah Konfigurasi (`Config`)
 Sheet **Config** menyimpan parameter operasional sistem. Admin dapat mengubah nilai di kolom `Value` tanpa menyentuh kode:
 - `max_new_posts_per_run`: Jumlah maksimal post baru per eksekusi (default: 100).
-- `max_results_per_input`: Jumlah postingan per akun/keyword dalam 1 panggilan actor (default: 20). Nilai ini juga menjadi langkah pagination.
-- `max_results_ceiling_per_source`: Batas atas pagination per sumber (default: 200). Jika sebuah sumber masih menghasilkan data sampai batas ini, sumber tersebut dicatat di `pending_ranges` (Run State) dan eksekusi menjadi `Partial`.
+- `max_results_per_input`: Jumlah postingan per keyword dalam 1 panggilan actor (default: 20), dan juga langkah eskalasi `maxPostsPerKeyword` pada jendela satu hari. Untuk Source Accounts nilainya hanya menjadi `resultsLimit` pertama bila `account_start_limit_*` tidak diisi; eskalasi akun tidak lagi memakai kelipatan nilai ini (lihat catatan biaya di bawah).
+- `max_results_ceiling_per_source`: Batas atas pagination per sumber (default: 200). Jika sebuah sumber masih penuh sampai batas ini, nilai ceiling tersebut dicatat di alasan entri `pending_ranges` (mis. `ceiling=300`), entri tetap terdaftar di Run State, dan eksekusi menjadi `Partial`. Sumber itu **tidak** di-scrape ulang pada eksekusi berikutnya sampai nilai ini dinaikkan (lihat catatan biaya di bawah).
 - `gemini_delay_seconds`: Jeda sequential antar-panggilan Gemini (default: 6 detik).
 - `gemini_model`: Model AI yang digunakan (default: `gemini-3.5-flash-lite`).
 - `max_failed_run_attempts`: Berapa kali satu post boleh gagal ekstraksi sebelum tidak diulang otomatis (default: 3). Lihat bagian 8.
 - `account_start_limit_initial`: `resultsLimit` **pertama** untuk Source Accounts pada Initial Scraping (default: 20). Nilai di atas `max_results_ceiling_per_source` otomatis dibatasi ke ceiling tersebut.
 - `account_start_limit_routine`: Sama seperti di atas, khusus Routine Scraping (default: 20).
 
-> Catatan biaya Apify (belum terverifikasi): pagination akun menaikkan `resultsLimit` per langkah (20, 40, 60, ...), dan setiap langkah adalah satu actor run berbayar. Eksperimen biaya tersedia di sel opt-in `notebooks/test_apify_actors_phase0.ipynb` (bagian 4). **Setelah** pengukuran nyata menunjukkan permintaan besar tidak lebih mahal, admin dapat menaikkan `account_start_limit_initial` (mis. 100) tanpa mengubah kode; langkah eskalasi dan ceiling tetap sama.
+> **Catatan biaya Apify (Fix 8).** Pengukuran menunjukkan biaya per item yang dikembalikan **naik** seiring kedalaman halaman (\$0,00162/item pada 20 hasil, \$0,00243/item pada 100 hasil), dan setiap langkah eskalasi mengulang scraping dari awal — jadi 20/40/60/... adalah jalur paling mahal. Karena itu pagination akun sekarang:
+> 1. Menjalankan `account_start_limit_*` lebih dulu. Bila hasil mentahnya **penuh** (jumlah item == `resultsLimit`), permintaan kedua **langsung** memakai `max_results_ceiling_per_source`. Maksimal **2 actor run per akun** per eksekusi, bukan 20/40/60/....
+> 2. Bila sumber masih penuh sampai ceiling, entri `pending_ranges`-nya menyimpan nilai ceiling yang tercapai (mis. `ceiling=300`). Pada eksekusi berikutnya sumber itu **tidak di-scrape ulang** (tidak memakan kredit) selama `max_results_ceiling_per_source` belum dinaikkan; entri tetap ada di `pending_ranges` dan `Execution Log` menulis `ceiling reached for <account>, raise max_results_ceiling_per_source in Config`. Entri seperti ini juga **tidak** menahan `global_checkpoint`.
+> 3. Untuk mengambil sisanya, naikkan `max_results_ceiling_per_source` di atas nilai yang tercatat. Sumber tersebut otomatis dijalankan **pertama** (dengan tanggal `from` aslinya) dan entrinya dihapus begitu selesai.
+>
+> Nilai Config yang direkomendasikan berdasarkan pengukuran tersebut:
+>
+> | Key | Value |
+> |---|---|
+> | `account_start_limit_initial` | `200` |
+> | `account_start_limit_routine` | `40` |
+> | `max_results_ceiling_per_source` | `300` |
+>
+> Dengan nilai ini Initial Scraping memakai paling banyak 2 run per akun (200 lalu 300) dan Routine tetap murah (40, lalu 300 hanya bila 40 pertama sudah penuh). Eksperimen biaya dapat diulang di sel opt-in `notebooks/test_apify_actors_phase0.ipynb` (bagian 4).
 
 ### 2. Cara Mengisi & Mengelola `Source Accounts`
 Buka sheet **Source Accounts**:
@@ -74,7 +87,8 @@ Sheet **Execution Log** mencatat riwayat setiap eksekusi:
 - `global_checkpoint` menunjukkan **sampai kapan scraping sudah tercakup**, bukan "semua post berhasil diekstrak".
 - Checkpoint maju bila seluruh sumber run ini selesai di-scrape atau tercatat di `pending_ranges` (dengan tanggal `from` masing-masing), tidak ada entri `pending_ranges` yang terbuang, semua post baru sudah tersimpan di System Log, dan run bukan outage total.
 - Kegagalan ekstraksi Gemini, post yang menjadi dead, dan halt karena error permanen **tidak** menahan checkpoint: post tersebut diambil ulang dari System Log tanpa scraping ulang (hemat kredit Apify).
-- Checkpoint **tidak** maju bila pada run itu tidak ada satu pun sumber yang selesai di-scrape: semua sumber error, atau satu-satunya sumber mentok `max_results_ceiling_per_source`, atau tertunda kuota 100 post. Sumber tersebut tercatat di `pending_ranges` dan dijalankan pertama pada run berikutnya; bila penyebabnya ceiling, naikkan `max_results_ceiling_per_source` agar suatu run bisa menyelesaikan minimal satu sumber.
+- Checkpoint **tidak** maju bila pada run itu tidak ada satu pun sumber yang selesai di-scrape: semua sumber error, atau satu-satunya sumber mentok `max_results_ceiling_per_source`, atau tertunda kuota 100 post. Sumber tersebut tercatat di `pending_ranges` dan dijalankan pertama pada run berikutnya.
+- Bila penyebabnya ceiling, run berikutnya **tidak** mengulang scrape sumber itu selama `max_results_ceiling_per_source` belum dinaikkan (hemat kredit), dan sumber yang di-skip tersebut tidak lagi menahan checkpoint. Naikkan nilainya agar sumber itu dijalankan pertama dan entrinya dibersihkan.
 - Nilai checkpoint adalah waktu MULAI run. Post yang terbit saat run berjalan akan diambil run berikutnya; Post-ID dedup membuat post yang sudah dikenal tidak memakan kuota.
 - `keyword_run_counter` (untuk Frequency) naik setiap kali checkpoint maju, termasuk pada run `Partial` yang setidaknya satu sumbernya selesai.
 - D13 tetap berlaku: Routine menolak berjalan bila checkpoint masih kosong.

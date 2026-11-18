@@ -6,6 +6,7 @@ Instruction 25: pending_ranges dedup, remove completed entries, enforce 50k JSON
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Set, Tuple
 from compmon.models import PendingRange
@@ -60,6 +61,29 @@ def parse_pending_ranges(raw_json: Optional[str]) -> List[PendingRange]:
 def _pending_key(pr: PendingRange) -> Tuple[str, str, str, str]:
     """Returns a deduplication key for a PendingRange (ignores reason)."""
     return (pr.source_type, pr.source, pr.from_date, pr.to_date)
+
+
+# Fix 8: a ceiling-hit reason records the ceiling that was reached, e.g. "ceiling=300".
+# The pattern does not match "max_results_ceiling_per_source=300" on purpose: only the
+# explicit marker written by the pipeline identifies a ceiling block.
+CEILING_MARKER_RE = re.compile(r"ceiling\s*=\s*(\d+)")
+
+
+def ceiling_from_reason(reason: Optional[str]) -> Optional[int]:
+    """Returns the ceiling recorded in a pending reason ("ceiling=300" -> 300), else None."""
+    match = CEILING_MARKER_RE.search(str(reason or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:  # pragma: no cover - regex guarantees digits
+        return None
+
+
+def recorded_ceiling(ranges: List[PendingRange]) -> Optional[int]:
+    """Highest ceiling recorded among a source's pending entries (None when none)."""
+    values = [v for v in (ceiling_from_reason(pr.reason) for pr in ranges) if v is not None]
+    return max(values) if values else None
 
 
 @dataclass
@@ -223,7 +247,10 @@ def checkpoint_should_advance(
         some posts were stored.
 
     Things that deliberately do NOT block it: Gemini extraction failures, dead posts
-    (D17), a `GeminiPermanentError` halt, and posts left `Pending` by the processing cap.
+    (D17), a `GeminiPermanentError` halt, posts left `Pending` by the processing cap, and a
+    source that was not scraped at all because its ceiling entry is waiting for the owner to
+    raise `max_results_ceiling_per_source` (Fix 8: such a source is not attempted, so it is
+    neither counted in `total_sources` nor in `attempted_sources`).
     """
     # (b) A dropped pending entry means an unfinished source was lost.
     if dropped_entries > 0:
