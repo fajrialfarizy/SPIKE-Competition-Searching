@@ -18,8 +18,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Ceiling for the pagination loop (Task 23).
     # The pipeline increases resultsLimit in multiples of max_results_per_input up to this ceiling.
     "max_results_ceiling_per_source": 200,
+    # First resultsLimit of the account pagination loop (Task 23 keeps the escalation).
+    "account_start_limit_initial": 20,
+    "account_start_limit_routine": 20,
     "gemini_delay_seconds": 6,
     "gemini_max_retries": 3,
+    "max_failed_run_attempts": 3,
     "batch_size": 10,
     "initial_days_accounts": 60,
     "initial_days_core_keywords": 30,
@@ -39,8 +43,11 @@ class AppConfig:
     max_new_posts_per_run: int
     max_results_per_input: int
     max_results_ceiling_per_source: int
+    account_start_limit_initial: int
+    account_start_limit_routine: int
     gemini_delay_seconds: int
     gemini_max_retries: int
+    max_failed_run_attempts: int
     batch_size: int
     initial_days_accounts: int
     initial_days_core_keywords: int
@@ -71,8 +78,9 @@ def validate_and_parse_config(raw_config: Dict[str, Any]) -> AppConfig:
 
     int_fields = [
         "max_new_posts_per_run", "max_results_per_input", "max_results_ceiling_per_source",
-        "gemini_delay_seconds", "gemini_max_retries", "batch_size", "initial_days_accounts",
-        "initial_days_core_keywords", "initial_days_discovery_keywords",
+        "account_start_limit_initial", "account_start_limit_routine",
+        "gemini_delay_seconds", "gemini_max_retries", "max_failed_run_attempts", "batch_size",
+        "initial_days_accounts", "initial_days_core_keywords", "initial_days_discovery_keywords",
         "min_reviewed_for_priority", "threshold_high", "threshold_medium"
     ]
     parsed_ints = {}
@@ -98,6 +106,18 @@ def validate_and_parse_config(raw_config: Dict[str, Any]) -> AppConfig:
         raise ValueError(
             f"Config 'max_results_ceiling_per_source' ({ceiling}) must be >= 'max_results_per_input' "
             f"({parsed_ints['max_results_per_input']})"
+        )
+
+    for start_key in ("account_start_limit_initial", "account_start_limit_routine"):
+        if parsed_ints[start_key] <= 0:
+            raise ValueError(
+                f"Config '{start_key}' must be a positive integer, got {parsed_ints[start_key]}"
+            )
+
+    if parsed_ints["max_failed_run_attempts"] <= 0:
+        raise ValueError(
+            f"Config 'max_failed_run_attempts' must be a positive integer, got "
+            f"{parsed_ints['max_failed_run_attempts']}"
         )
 
     if parsed_ints["max_new_posts_per_run"] <= 0:
@@ -141,9 +161,13 @@ def validate_and_parse_config(raw_config: Dict[str, Any]) -> AppConfig:
         gemini_model=str(merged.get("gemini_model", DEFAULT_CONFIG["gemini_model"])).strip(),
         max_new_posts_per_run=parsed_ints["max_new_posts_per_run"],
         max_results_per_input=parsed_ints["max_results_per_input"],
-        max_results_ceiling_per_source=parsed_ints["max_results_ceiling_per_source"],
+        max_results_ceiling_per_source=ceiling,
+        # A start limit above the ceiling is clamped, never rejected (Fix 6B).
+        account_start_limit_initial=min(parsed_ints["account_start_limit_initial"], ceiling),
+        account_start_limit_routine=min(parsed_ints["account_start_limit_routine"], ceiling),
         gemini_delay_seconds=parsed_ints["gemini_delay_seconds"],
         gemini_max_retries=parsed_ints["gemini_max_retries"],
+        max_failed_run_attempts=parsed_ints["max_failed_run_attempts"],
         batch_size=parsed_ints["batch_size"],
         initial_days_accounts=parsed_ints["initial_days_accounts"],
         initial_days_core_keywords=parsed_ints["initial_days_core_keywords"],

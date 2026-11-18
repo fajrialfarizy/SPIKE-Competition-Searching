@@ -13,7 +13,7 @@ Rules:
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +61,11 @@ INITIAL_SHEETS_DATA: Dict[str, Dict[str, Any]] = {
             ["max_new_posts_per_run", "100", "Batas maksimal post BARU yang diambil per satu run notebook"],
             ["max_results_per_input", "20", "Jumlah hasil per sumber per actor run (juga langkah pagination)"],
             ["max_results_ceiling_per_source", "200", "Batas atas pagination resultsLimit per sumber; bila tercapai sumber dicatat di pending_ranges"],
+            ["account_start_limit_initial", "20", "resultsLimit pertama untuk Source Accounts pada Initial Scraping (di-clamp ke max_results_ceiling_per_source)"],
+            ["account_start_limit_routine", "20", "resultsLimit pertama untuk Source Accounts pada Routine Scraping (di-clamp ke max_results_ceiling_per_source)"],
             ["gemini_delay_seconds", "6", "Jeda detik antar request sequential ke Gemini API"],
             ["gemini_max_retries", "3", "Maksimal percobaan ulang request Gemini API saat terjadi error/429"],
+            ["max_failed_run_attempts", "3", "Maksimal jumlah run di mana satu post boleh gagal ekstraksi sebelum tidak diulang otomatis (D17)"],
             ["batch_size", "10", "Ukuran batch internal pemrosesan dan penulisan status"],
             ["initial_days_accounts", "60", "Rentang hari scraping awal untuk Source Accounts"],
             ["initial_days_core_keywords", "30", "Rentang hari scraping awal untuk Core Keywords"],
@@ -195,38 +198,92 @@ def _sheet_padded(expr: str) -> str:
     return f'(" "&{_sheet_norm(expr)}&" ")'
 
 
-def _entity_pattern(range_ref: str) -> str:
-    """
-    Builds a regex alternation from NON-EMPTY master cells only.
+# Each compiled alias pattern lives in ONE generated cell of the `Grade Rules` sheet and
+# is exposed as a named range. Inlining the SPLIT/FLATTEN/TEXTJOIN/LET expression in every
+# rule branch made `Competition Report!D2` several KB long; a branch now only references the
+# name, which keeps the formula small and fast to recalculate.
+GRADE_HELPER_LABEL_COL = "F"
+GRADE_HELPER_VALUE_COL = "G"
+GRADE_HELPER_HEADER = "Auto-generated alias pattern (do not edit)"
 
-    `FILTER(range, LEN(range)>0)` drops empty alias cells, so an empty alias can no longer
-    become a bare word-boundary that matches every row (the original bug). Every name is
-    token-normalized and padded, so entries are matched as whole phrases; if the master
-    sheet is empty the pattern matches nothing (`[^\\s\\S]`).
+ENTITY_PATTERN_NAMED_RANGES: Dict[str, Dict[str, Any]] = {
+    "TOP_UNIV_PATTERN": {
+        "source_range": "'Master Top University'!A$2:B",
+        "row": 2,
+    },
+    "TOP_ORG_PATTERN": {
+        "source_range": "'Master Top Organizer'!A$2:B",
+        "row": 3,
+    },
+}
+
+
+def _col_index(letter: str) -> int:
+    """0-based column index of an A1 column letter."""
+    index = 0
+    for char in letter.upper():
+        index = index * 26 + (ord(char) - ord("A") + 1)
+    return index - 1
+
+
+def _alias_pattern_expression(range_ref: str) -> str:
     """
-    filtered = f"FILTER({range_ref},LEN({range_ref})>0)"
+    Builds a regex alternation from every NON-EMPTY alias of a master sheet.
+
+    Master `Aliases` cells may hold SEVERAL comma-separated aliases (`UI, BEM UI`), exactly
+    as `compmon.sheets_repo.load_master_entities` splits them, so the formula must split on
+    "," too. The range is joined into one string with `TEXTJOIN` (a Sheets `SPLIT` over an
+    array is not reliable), then `SPLIT` -> `FLATTEN` -> `TRIM`, so `FILTER` receives a 1-D
+    `LEN()` condition, which is what Google Sheets accepts. Empty cells/aliases are dropped,
+    so they can never become a pattern that matches every row.
+
+    There is no `IFERROR`: a genuine formula error stays visible. Only a truly empty master
+    range is handled explicitly, with `IF(COUNTA(range)=0, ...)` returning a pattern that
+    matches nothing (`[^\\s\\S]`).
+    """
+    joined = f'TEXTJOIN(",",TRUE,FLATTEN({range_ref}))'
     return (
-        f'IFERROR(TEXTJOIN("|",TRUE,{_sheet_padded(filtered)}),"[^\\s\\S]")'
+        f'IF(COUNTA({range_ref})=0,"[^\\s\\S]",'
+        f"LET(flat,{joined},"
+        'tokens,ARRAYFORMULA(TRIM(FLATTEN(SPLIT(flat,",")))),'
+        "names,FILTER(tokens,LEN(tokens)>0),"
+        'padded,ARRAYFORMULA(IF(LEN(REGEXREPLACE(LOWER(names),"[[:punct:]]+"," "))>0,'
+        '" "&REGEXREPLACE(REGEXREPLACE(LOWER(names),"[[:punct:]]+"," "),"\\s+"," ")&" ","")),'
+        'joined,TEXTJOIN("|",TRUE,padded),'
+        'IF(joined="","[^\\s\\S]",joined)))'
     )
 
 
-def build_grade_arrayformula(grade_rule_rows: List[List[Any]]) -> str:
+GRADE_PATTERN_HELPER_FORMULAS: Dict[str, str] = {
+    name: "=" + _alias_pattern_expression(spec["source_range"])
+    for name, spec in ENTITY_PATTERN_NAMED_RANGES.items()
+}
+
+
+def build_grade_arrayformula(grade_rule_rows: List[List[Any]],
+                             patterns: Optional[Dict[str, str]] = None) -> str:
     """
     Builds the single D2 ARRAYFORMULA from the `Grade Rules` table.
+
+    `patterns` overrides the pattern expression per entity (used by the tests to measure how
+    much the named-range indirection saves); it defaults to the named-range names.
 
     - rules are ordered by Priority (first match wins), never by hard-coded row numbers;
     - the grade value is looked up from the Grade Rules sheet by Priority, so editing the
       Grade column is honoured without touching the formula;
     - Entity/Skala/Mode criteria come from each rule row;
-    - Hybrid is treated as Offline; required inputs missing -> "Unknown"; blank row -> "".
+    - Hybrid is treated as Offline; required inputs missing -> "Unknown"; blank row -> "";
+    - a value outside the recognised Skala/Mode sets -> "Unknown" (same as the oracle).
     """
     rules = sorted(
         grade_rule_rows,
         key=lambda r: int(str(r[0]).strip()) if str(r[0]).strip().isdigit() else 9999,
     )
 
-    univ_pattern = _entity_pattern("'Master Top University'!A$2:B")
-    org_pattern = _entity_pattern("'Master Top Organizer'!A$2:B")
+    # Named ranges over the helper cells in `Grade Rules` (see _install_grade_pattern_helpers).
+    override = patterns or {}
+    univ_pattern = override.get("TOP_UNIV_PATTERN", "TOP_UNIV_PATTERN")
+    org_pattern = override.get("TOP_ORG_PATTERN", "TOP_ORG_PATTERN")
 
     univ_text = _sheet_padded(f"{COL_UNIV}2:{COL_UNIV}")
     peny_text = _sheet_padded(f"{COL_PENY}2:{COL_PENY}")
@@ -240,6 +297,16 @@ def build_grade_arrayformula(grade_rule_rows: List[List[Any]]) -> str:
     mode_offline = (
         f'((REGEXMATCH({mode_text}," offline ")+REGEXMATCH({mode_text}," hybrid "))>0)'
     )
+    # Parity with the Python oracle: a Skala that is neither Nasional nor Internasional, or
+    # a Pelaksanaan Final that is not Online/Offline/Hybrid, must be "Unknown" in BOTH.
+    skala_known = (
+        f'(REGEXMATCH({skala_text}," internasional ")+REGEXMATCH({skala_text}," nasional "))'
+    )
+    mode_known = (
+        f'(REGEXMATCH({mode_text}," online ")+REGEXMATCH({mode_text}," offline ")'
+        f'+REGEXMATCH({mode_text}," hybrid "))'
+    )
+    unrecognized_condition = f"(((({skala_known})=0)+(({mode_known})=0))>0)"
 
     entity_expr = {
         "Top University": top_univ,
@@ -269,6 +336,7 @@ def build_grade_arrayformula(grade_rule_rows: List[List[Any]]) -> str:
     branches = [
         f"{blank_condition}, \"\"",
         f"{missing_condition}, \"Unknown\"",
+        f"{unrecognized_condition}, \"Unknown\"",
     ]
 
     for row in rules:
@@ -382,8 +450,12 @@ def populate_template(spreadsheet_client: Any, spreadsheet_id: str):
     Sets up the 11 worksheets safely:
     - never clears existing sheets and never overwrites filled cells;
     - creates missing sheets with SHEET_ROWS rows so explicit-range writes never fail;
+    - writes the alias-pattern helper cells in `Grade Rules` and registers the named ranges
+      `TOP_UNIV_PATTERN` / `TOP_ORG_PATTERN` the Grade formula references (never overwriting
+      admin text);
     - installs the Grade ARRAYFORMULA in D2 only when D2 is empty or holds an older
-      generated formula;
+      generated formula **and** both named ranges are confirmed to exist; otherwise D2 is
+      left untouched with one actionable warning instead of a formula full of #NAME?;
     - installs the Status Pemeriksaan dropdown, the Post ID text format and idempotent,
       full-sheet protected ranges.
     """
@@ -406,9 +478,29 @@ def populate_template(spreadsheet_client: Any, spreadsheet_id: str):
             else:
                 logger.info(f"Sheet '{sheet_name}' already initialised; left untouched")
 
+    grade_ws = existing_ws.get("Grade Rules")
+    missing_patterns: Set[str] = set(ENTITY_PATTERN_NAMED_RANGES)
+    if grade_ws:
+        missing_patterns = _install_grade_pattern_helpers(sh, grade_ws)
+
     comp_ws = existing_ws.get("Competition Report")
     if comp_ws:
-        _install_grade_formula(comp_ws)
+        if missing_patterns:
+            # Writing D2 without its named ranges would show #NAME? in every Grade cell, which
+            # looks like a grading bug. Keep the header, leave D2 alone, warn once.
+            _install_grade_formula(comp_ws, patterns_ready=False)
+            logger.warning(
+                "Competition Report!D2 was left untouched because the named range(s) %s are "
+                "missing: the Grade formula would show #NAME? in every row. Cause: "
+                "addNamedRange was rejected (the Google account needs edit access to this "
+                "spreadsheet, and a name cannot be created twice). Fix: re-run this cell with "
+                "an account that can edit the file, or create the named ranges by hand "
+                "(Data > Named ranges) pointing at 'Grade Rules'!G2 and 'Grade Rules'!G3, "
+                "then re-run this cell.",
+                ", ".join(sorted(missing_patterns)),
+            )
+        else:
+            _install_grade_formula(comp_ws)
         _install_status_validation(sh, comp_ws)
         _ensure_protected_ranges(sh, comp_ws)
 
@@ -419,8 +511,14 @@ def populate_template(spreadsheet_client: Any, spreadsheet_id: str):
     print(f"Template populated safely without overwrite for Spreadsheet: {spreadsheet_id}")
 
 
-def _install_grade_formula(comp_ws):
-    """Writes D1 header / D2 ARRAYFORMULA only where it is safe to do so."""
+def _install_grade_formula(comp_ws, patterns_ready: bool = True):
+    """
+    Writes D1 header / D2 ARRAYFORMULA only where it is safe to do so.
+
+    `patterns_ready=False` means the named ranges the formula references are not confirmed to
+    exist: D1 is still written, but D2 is left completely untouched so the column cannot fill
+    with #NAME?.
+    """
     values = comp_ws.get_all_values()
     d1 = values[0][3].strip() if values and len(values[0]) > 3 else ""
     d2 = values[1][3].strip() if len(values) > 1 and len(values[1]) > 3 else ""
@@ -428,6 +526,9 @@ def _install_grade_formula(comp_ws):
     if not d1:
         comp_ws.update(range_name="D1", values=[["Grade Lomba"]], value_input_option="RAW")
         logger.info("Wrote Grade Lomba header to D1")
+
+    if not patterns_ready:
+        return
 
     if not d2:
         comp_ws.update(range_name="D2", values=[[GRADE_ARRAYFORMULA_D2]], value_input_option="USER_ENTERED")
@@ -437,6 +538,121 @@ def _install_grade_formula(comp_ws):
         logger.info("Refreshed generated Grade ARRAYFORMULA in D2")
     else:
         logger.warning("D2 already contains a non-generated value; left untouched")
+
+
+def _cell_at(values: List[List[str]], row: int, letter: str) -> str:
+    """Sheet value at a 1-based row and A1 column letter ("" when absent)."""
+    index = _col_index(letter)
+    if row - 1 >= len(values):
+        return ""
+    line = values[row - 1]
+    if index >= len(line):
+        return ""
+    return (line[index] or "").strip()
+
+
+def _install_grade_pattern_helpers(sh, grade_ws) -> Set[str]:
+    """
+    Puts each compiled alias pattern in ONE cell of `Grade Rules` (columns F-G) and exposes
+    it as a named range, so `Competition Report!D2` stays small.
+
+    Returns the names that could NOT be confirmed to exist (empty set = all good). The caller
+    must not install D2 when this set is non-empty.
+
+    Safe to re-run: a label or pattern cell is written only when it is EMPTY (an admin value
+    is never overwritten), and a named range is created only when that name is not
+    registered yet. To regenerate a pattern after a generator change, clear `F2:G3` and run
+    the notebook cell again.
+    """
+    values = grade_ws.get_all_values()
+
+    if not _cell_at(values, 1, GRADE_HELPER_LABEL_COL):
+        grade_ws.update(
+            range_name=f"{GRADE_HELPER_LABEL_COL}1",
+            values=[[GRADE_HELPER_HEADER]],
+            value_input_option="RAW",
+        )
+        logger.info("Wrote the alias-pattern helper header to Grade Rules")
+
+    for name, spec in ENTITY_PATTERN_NAMED_RANGES.items():
+        row = spec["row"]
+        label_cell = f"{GRADE_HELPER_LABEL_COL}{row}"
+        value_cell = f"{GRADE_HELPER_VALUE_COL}{row}"
+
+        if not _cell_at(values, row, GRADE_HELPER_LABEL_COL):
+            grade_ws.update(range_name=label_cell, values=[[name]], value_input_option="RAW")
+
+        current = _cell_at(values, row, GRADE_HELPER_VALUE_COL)
+        if not current:
+            grade_ws.update(
+                range_name=value_cell,
+                values=[[GRADE_PATTERN_HELPER_FORMULAS[name]]],
+                value_input_option="USER_ENTERED",
+            )
+            logger.info(f"Wrote alias pattern {name} to Grade Rules!{value_cell}")
+        else:
+            logger.warning(
+                f"Grade Rules!{value_cell} already holds a value; left untouched "
+                "(clear the cell to regenerate the pattern)"
+            )
+
+    return _ensure_grade_named_ranges(sh, grade_ws)
+
+
+def _ensure_grade_named_ranges(sh, grade_ws) -> Set[str]:
+    """
+    Creates the named ranges the Grade formula references, skipping existing names, and
+    returns the ones still MISSING (empty set = all present).
+
+    `addNamedRange` only returns when it created the range, so the return value is derived
+    from which calls succeeded — no second listing needed. A missing name means the caller
+    must not install a formula that references it (it would evaluate to #NAME?).
+
+    `list_named_ranges` exists in the pinned gspread 6.1.4, so a failure there is a broken
+    run (permissions, revoked token) and is allowed to propagate.
+    """
+    confirmed = {item.get("name") for item in sh.list_named_ranges() or []}
+    column = _col_index(GRADE_HELPER_VALUE_COL)
+    requests = []
+    for name, spec in ENTITY_PATTERN_NAMED_RANGES.items():
+        if name in confirmed:
+            continue
+        requests.append({
+            "addNamedRange": {
+                "namedRange": {
+                    "name": name,
+                    "range": {
+                        "sheetId": grade_ws.id,
+                        "startRowIndex": spec["row"] - 1,
+                        "endRowIndex": spec["row"],
+                        "startColumnIndex": column,
+                        "endColumnIndex": column + 1,
+                    },
+                    "description": "Compiled alias pattern used by the Grade Lomba formula",
+                }
+            }
+        })
+
+    if not requests:
+        return set()
+
+    try:
+        sh.batch_update({"requests": requests})
+        confirmed.update(r["addNamedRange"]["namedRange"]["name"] for r in requests)
+        logger.info("Registered named ranges %s", ", ".join(ENTITY_PATTERN_NAMED_RANGES))
+    except Exception as e:
+        # One rejected request rejects the batch; retry individually so a single bad name
+        # does not hide the others.
+        logger.warning(f"Could not register the named ranges in one batch ({e}); retrying one by one")
+        for request in requests:
+            name = request["addNamedRange"]["namedRange"]["name"]
+            try:
+                sh.batch_update({"requests": [request]})
+                confirmed.add(name)
+            except Exception as inner:
+                logger.warning(f"Named range {name} was not created: {inner}")
+
+    return {name for name in ENTITY_PATTERN_NAMED_RANGES if name not in confirmed}
 
 
 def _install_status_validation(sh, comp_ws):

@@ -4,11 +4,14 @@ Wrapper for running Apify actors and normalizing datasets into RawPost objects.
 Guarantees:
 - Post ID is ALWAYS derived as shortcode from URL (Instruction 21).
 - Checks run['status'] == 'SUCCEEDED' before processing dataset; otherwise treats as source failure (Instruction 15).
+- Returns `(posts, raw_count)`; `raw_count` is the number of dataset items the actor
+  returned BEFORE the Python date filter. Pagination completeness is decided from it, so
+  pinned posts older than the cut-off can never make a saturated run look exhausted (Fix 3).
 """
 
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from compmon.models import RawPost, SourceType
 from compmon.validator import extract_shortcode, parse_iso_timestamp, validate_raw_post_fields
 
@@ -103,10 +106,13 @@ class ApifyScraperClient:
         account_username: str,
         results_limit: int,
         only_posts_newer_than: Optional[str] = None
-    ) -> List[RawPost]:
+    ) -> Tuple[List[RawPost], int]:
         """
         Runs apify/instagram-scraper for a target account.
         Verifies run['status'] == 'SUCCEEDED' (Instruction 15).
+
+        Returns (posts inside the date window, raw item count returned by the actor).
+        The raw count is measured before de-duplication and before the date filter.
         """
         if not self.client:
             raise RuntimeError("apify-client library is not installed")
@@ -134,9 +140,10 @@ class ApifyScraperClient:
         if not dataset_id:
             raise RuntimeError(f"No defaultDatasetId in run output for {account_username}")
 
-        dataset_items = self.client.dataset(dataset_id).list_items().items
+        dataset_items = self.client.dataset(dataset_id).list_items().items or []
+        raw_count = len(dataset_items)
         posts: List[RawPost] = []
-        
+
         cutoff_dt: Optional[datetime] = None
         if only_posts_newer_than:
             cutoff_dt = parse_iso_timestamp(only_posts_newer_than)
@@ -148,7 +155,7 @@ class ApifyScraperClient:
                     continue
                 posts.append(norm)
 
-        return posts
+        return posts, raw_count
 
     def scrape_keyword_posts(
         self,
@@ -157,10 +164,12 @@ class ApifyScraperClient:
         max_posts: int,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
-    ) -> List[RawPost]:
+    ) -> Tuple[List[RawPost], int]:
         """
         Runs seemuapps/instagram-keyword-posts-scraper for a single keyword.
         Verifies run['status'] == 'SUCCEEDED' (Instruction 15).
+
+        Returns (posts inside the date window, raw item count returned by the actor).
 
         Verified actor inputs (apify.com/seemuapps/instagram-keyword-posts-scraper):
         `keywords`, `maxPostsPerKeyword`, `dateFrom`, `dateTo` and `pageId`.
@@ -195,7 +204,8 @@ class ApifyScraperClient:
         if not dataset_id:
             raise RuntimeError(f"No defaultDatasetId in run output for keyword '{keyword}'")
 
-        dataset_items = self.client.dataset(dataset_id).list_items().items
+        dataset_items = self.client.dataset(dataset_id).list_items().items or []
+        raw_count = len(dataset_items)
         posts: List[RawPost] = []
 
         cutoff_dt: Optional[datetime] = None
@@ -209,4 +219,4 @@ class ApifyScraperClient:
                     continue
                 posts.append(norm)
 
-        return posts
+        return posts, raw_count

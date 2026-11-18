@@ -195,11 +195,61 @@ def group_pending_by_source(
     return grouped
 
 
-def should_update_checkpoint(execution_status: str) -> bool:
+def checkpoint_should_advance(
+    attempted_sources: List[Tuple[str, str]],
+    completed_source_keys: Set[Tuple[str, str]],
+    pending_ranges: List[PendingRange],
+    dropped_entries: int = 0,
+    new_posts_stored: bool = True,
+    total_sources: int = 0,
+    completed_sources: int = 0,
+) -> bool:
     """
-    PRD 6.2 & 6.13:
-    Checkpoint ONLY updates if the entire execution is 'Success'.
-    If Partial or Failed, old checkpoint MUST be preserved.
+    Decision D18 (owner-approved override of PRD 6.2 / 6.13):
+
+    The checkpoint describes SCRAPING coverage, not extraction success. Raw posts are
+    stored before AI processing and extraction retries read from System Log, so a failed
+    Gemini extraction never justifies re-scraping (and re-paying Apify for) the window.
+
+    The checkpoint advances when ALL of these hold:
+
+    (a) every source attempted in this run was either fully scraped or recorded in
+        `pending_ranges` with its own `from` date (nothing is silently lost);
+    (b) the `pending_ranges` merge dropped nothing (`dropped_entries == 0`);
+    (c) every newly scraped post was written to System Log;
+    (d) it was not an outage: if `total_sources > 0` then `completed_sources >= 1`.
+        A run in which no source finished (every source errored, hit the pagination
+        ceiling, or was deferred by the per-run cap) keeps the old checkpoint, even when
+        some posts were stored.
+
+    Things that deliberately do NOT block it: Gemini extraction failures, dead posts
+    (D17), a `GeminiPermanentError` halt, and posts left `Pending` by the processing cap.
     """
-    return execution_status == "Success"
+    # (b) A dropped pending entry means an unfinished source was lost.
+    if dropped_entries > 0:
+        return False
+
+    # (c)
+    if not new_posts_stored:
+        return False
+
+    # (d) Literal: no completed source means the run is treated as an outage.
+    if total_sources > 0 and completed_sources < 1:
+        return False
+
+    # (a)
+    pending_from: Dict[Tuple[str, str], str] = {
+        (pr.source_type, pr.source): (pr.from_date or "").strip() for pr in pending_ranges
+    }
+    for source_key in attempted_sources:
+        if source_key in completed_source_keys:
+            continue
+        if not pending_from.get(source_key):
+            logger.warning(
+                "Checkpoint not advanced: unfinished source "
+                f"{source_key[0]}:{source_key[1]} is missing from pending_ranges"
+            )
+            return False
+
+    return True
 

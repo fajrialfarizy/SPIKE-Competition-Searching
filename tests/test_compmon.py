@@ -29,6 +29,7 @@ from compmon.checkpoint import (
 )
 from compmon.exec_log import determine_execution_status
 from compmon.quota import ExecutionSafetyTracker
+from compmon.retry_policy import parse_attempts, set_attempts, is_dead
 
 
 TOP_UNIVS = [
@@ -308,6 +309,71 @@ class TestConfig(unittest.TestCase):
         cfg = validate_and_parse_config({})
         self.assertEqual(cfg.max_results_ceiling_per_source, 200)
         self.assertEqual(cfg.max_results_per_input, 20)
+
+    def test_account_start_limits_default_validate_and_clamp(self):
+        """Fix 6B: default behaviour unchanged (20), invalid values rejected, clamped."""
+        cfg = validate_and_parse_config({})
+        self.assertEqual(cfg.account_start_limit_initial, 20)
+        self.assertEqual(cfg.account_start_limit_routine, 20)
+
+        for bad in (0, -5, "text"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    validate_and_parse_config({"account_start_limit_initial": bad})
+                with self.assertRaises(ValueError):
+                    validate_and_parse_config({"account_start_limit_routine": bad})
+
+        clamped = validate_and_parse_config({
+            "max_results_ceiling_per_source": 60,
+            "account_start_limit_initial": 500,
+            "account_start_limit_routine": 100,
+        })
+        self.assertEqual(clamped.account_start_limit_initial, 60)
+        self.assertEqual(clamped.account_start_limit_routine, 60)
+
+    def test_max_failed_run_attempts_must_be_a_positive_integer(self):
+        self.assertEqual(validate_and_parse_config({}).max_failed_run_attempts, 3)
+        for bad in (0, -1, "x"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    validate_and_parse_config({"max_failed_run_attempts": bad})
+
+
+class TestRetryPolicy(unittest.TestCase):
+
+    def test_missing_marker_is_zero_attempts(self):
+        self.assertEqual(parse_attempts(""), 0)
+        self.assertEqual(parse_attempts(None), 0)
+        self.assertEqual(parse_attempts("Extraction Error: boom"), 0)
+
+    def test_marker_is_read_from_the_end(self):
+        self.assertEqual(parse_attempts("Extraction Error: boom [attempts=2]"), 2)
+        # A marker quoted in the middle of a message is not the counter.
+        self.assertEqual(parse_attempts("[attempts=9] something [attempts=1]"), 1)
+        self.assertEqual(parse_attempts("boom [attempts=2] trailing words"), 0)
+
+    def test_updates_do_not_stack_markers(self):
+        once = set_attempts("Extraction Error: boom", 1)
+        twice = set_attempts(once, 2)
+        thrice = set_attempts(twice, 3)
+        self.assertEqual(once, "Extraction Error: boom [attempts=1]")
+        self.assertEqual(twice, "Extraction Error: boom [attempts=2]")
+        self.assertEqual(thrice, "Extraction Error: boom [attempts=3]")
+        self.assertEqual(thrice.count("[attempts="), 1)
+        self.assertEqual(parse_attempts(thrice), 3)
+
+    def test_set_attempts_keeps_long_notes_intact(self):
+        long_note = "Extraction Error: " + ("z" * 5000)
+        updated = set_attempts(long_note, 2)
+        self.assertTrue(updated.startswith(long_note))
+        self.assertTrue(updated.endswith("[attempts=2]"))
+        self.assertEqual(parse_attempts(updated), 2)
+
+    def test_is_dead_uses_status_and_limit(self):
+        self.assertFalse(is_dead("Pending", "", 3))
+        self.assertFalse(is_dead("Failed", "boom [attempts=2]", 3))
+        self.assertTrue(is_dead("Failed", "boom [attempts=3]", 3))
+        self.assertTrue(is_dead("Failed", "boom [attempts=4]", 3))
 
 
 class TestPendingRanges(unittest.TestCase):

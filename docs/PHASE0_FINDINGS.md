@@ -27,6 +27,12 @@ Dokumen ini memuat hasil verifikasi teknis, batas kuota aktual, karakteristik ac
   - Tidak memiliki parameter batas atas tanggal (`until`). Paginasi bertahap Initial Scraping dilakukan dengan pembatasan `resultsLimit` dan deduplikasi Post ID.
   - Pinned post tetap dikembalikan meskipun lebih tua dari `onlyPostsNewerThan`. **Python wajib memfilter ulang**: `post.posted_at >= cutoff_date`.
 
+### 1.1b Biaya Pagination Akun (BELUM TERVERIFIKASI)
+- Pagination akun saat ini meminta 20, lalu 40, lalu 60 hasil, dan setiap langkah adalah satu actor run berbayar. Akun dengan 45 post kira-kira ditagih untuk ~120 hasil.
+- Hipotesis: satu permintaan besar (`resultsLimit` besar) bisa lebih murah karena actor umumnya hanya mengembalikan post yang ada di dalam window tanggal. **Ini belum diukur.**
+- Untuk mengukurnya tersedia sel opt-in di `notebooks/test_apify_actors_phase0.ipynb` bagian 4: satu akun, cutoff `onlyPostsNewerThan` 60 hari yang sama, dua run (`resultsLimit` 20 vs `MAX_TEST_RESULTS`), mencetak jumlah item mentah, item di dalam window, item lebih tua (pinned), `usageTotalUsd` + breakdown bila tersedia, dan biaya per item.
+- Status: `Not tested (needs real services)`. Tidak ada angka biaya yang diklaim di dokumen ini sampai pemilik proyek menempelkan output nyata.
+
 ### 1.2 Actor Keyword: `seemuapps/instagram-keyword-posts-scraper`
 - **Status Input/Output**: [DOKUMENTASI RESMI APIFY STORE]
 - **Parameter Input Terverifikasi**:

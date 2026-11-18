@@ -23,6 +23,22 @@ logger = logging.getLogger(__name__)
 
 COMPETITION_ID_PATTERN = "CMP-"
 
+# Google Sheets allows ~60 reads and ~60 writes per minute per user. Quota errors are
+# waited out with a much longer ladder than ordinary transient failures; at ~10 Gemini
+# posts per minute a 15 s first retry already keeps the run under the limit.
+QUOTA_BACKOFF_SECONDS = (15.0, 30.0, 60.0)
+
+
+def _is_quota_error(err_str: str) -> bool:
+    """429 / RESOURCE_EXHAUSTED / 'Quota exceeded' from the Sheets API."""
+    lowered = err_str.lower()
+    return (
+        "429" in err_str
+        or "resource_exhausted" in lowered
+        or "quota exceeded" in lowered
+        or "rate limit" in lowered
+    )
+
 
 class SheetsRepository:
     """Manages all Google Sheets API interactions with batching and append-safe writes."""
@@ -31,6 +47,9 @@ class SheetsRepository:
         self.client = spreadsheet_client
         self.spreadsheet_id = spreadsheet_id
         self._spreadsheet = None
+        # Worksheet handles are reused: `spreadsheet.worksheet(title)` is an API call, and
+        # per-post lookups would otherwise burn the per-minute read quota.
+        self._worksheets: Dict[str, Any] = {}
 
     @property
     def spreadsheet(self):
@@ -39,10 +58,32 @@ class SheetsRepository:
         return self._spreadsheet
 
     def get_worksheet(self, title: str):
-        return self.spreadsheet.worksheet(title)
+        """Returns the cached worksheet handle for `title`, fetching it only once."""
+        ws = self._worksheets.get(title)
+        if ws is None:
+            ws = self.spreadsheet.worksheet(title)
+            self._worksheets[title] = ws
+        return ws
+
+    def _invalidate_worksheet(self, title: Optional[str] = None):
+        """Drops cached handles after `add_rows` or after an API error."""
+        if title is None:
+            self._worksheets.clear()
+        else:
+            self._worksheets.pop(title, None)
+
+    def _read_all_values(self, ws) -> List[List[str]]:
+        """Reads a whole worksheet through the retry wrapper (reads share the quota too)."""
+        return self._execute_with_retry(lambda: ws.get_all_values())
 
     def _execute_with_retry(self, func, max_retries: int = 3, initial_delay: float = 1.0):
-        """Executes a Sheets API call with limited exponential backoff on temporary errors."""
+        """
+        Executes a Sheets API call with limited exponential backoff on temporary errors.
+
+        Quota errors (429 / RESOURCE_EXHAUSTED / 'Quota exceeded') use a long ladder
+        (15 s, 30 s, 60 s plus jitter). 403 / PERMISSION_DENIED / invalid range are
+        permanent and raised immediately.
+        """
         for attempt in range(1, max_retries + 1):
             try:
                 return func()
@@ -51,12 +92,22 @@ class SheetsRepository:
                 if "403" in err_str or "PERMISSION_DENIED" in err_str or "invalid range" in err_str.lower():
                     logger.error(f"Permanent Google Sheets error: {err_str}")
                     raise
+                # A failed call may mean the handle is stale; re-open it on the next use.
+                self._invalidate_worksheet()
                 logger.warning(f"Sheets API attempt {attempt}/{max_retries} failed: {err_str}")
                 if attempt == max_retries:
                     raise RuntimeError(
                         f"Google Sheets API call failed after {max_retries} retries: {err_str}"
                     ) from e
-                time.sleep((initial_delay * (2 ** (attempt - 1))) + random.uniform(0.1, 0.5))
+                if _is_quota_error(err_str):
+                    base = QUOTA_BACKOFF_SECONDS[
+                        min(attempt - 1, len(QUOTA_BACKOFF_SECONDS) - 1)
+                    ]
+                    delay = base + random.uniform(0.1, 1.0)
+                else:
+                    delay = (initial_delay * (2 ** (attempt - 1))) + random.uniform(0.1, 0.5)
+                logger.warning(f"Sheets retry in {delay:.1f}s")
+                time.sleep(delay)
 
     # ==========================================
     # Grid helpers (Task 27)
@@ -83,6 +134,8 @@ class SheetsRepository:
         missing = needed_rows - row_count
         logger.info(f"Growing worksheet '{getattr(ws, 'title', '?')}' by {missing} rows")
         self._execute_with_retry(lambda: ws.add_rows(missing))
+        # The handle's cached row_count is stale after growing the grid.
+        self._invalidate_worksheet(getattr(ws, "title", None))
 
     # ==========================================
     # Config & Run State Operations
@@ -91,7 +144,7 @@ class SheetsRepository:
     def load_config(self) -> Dict[str, Any]:
         """Loads key-value pairs from Config sheet."""
         ws = self.get_worksheet("Config")
-        records = ws.get_all_values()
+        records = self._read_all_values(ws)
         config_dict = {}
         for row in records[1:]:
             if len(row) >= 2 and row[0].strip():
@@ -101,7 +154,7 @@ class SheetsRepository:
     def load_run_state(self) -> Dict[str, Any]:
         """Loads state key-values from Run State sheet."""
         ws = self.get_worksheet("Run State")
-        records = ws.get_all_values()
+        records = self._read_all_values(ws)
         state_dict = {}
         for row in records[1:]:
             if len(row) >= 2 and row[0].strip():
@@ -111,7 +164,7 @@ class SheetsRepository:
     def update_run_state(self, updates: Dict[str, str], updated_at_iso: str):
         """Updates specific keys in Run State sheet."""
         ws = self.get_worksheet("Run State")
-        records = ws.get_all_values()
+        records = self._read_all_values(ws)
         key_to_row = {}
         for idx, row in enumerate(records[1:], start=2):
             if row and row[0].strip():
@@ -138,7 +191,7 @@ class SheetsRepository:
     def load_source_accounts(self) -> List[str]:
         """Loads list of usernames from Source Accounts sheet."""
         ws = self.get_worksheet("Source Accounts")
-        records = ws.get_all_values()
+        records = self._read_all_values(ws)
         return [row[0].strip().lstrip("@") for row in records[1:] if row and row[0].strip()]
 
     def load_search_keywords(self) -> List[Dict[str, Any]]:
@@ -154,7 +207,7 @@ class SheetsRepository:
         (needed because blank rows are skipped and list indexes are not sheet rows).
         """
         ws = self.get_worksheet("Search Keywords")
-        records = ws.get_all_values()
+        records = self._read_all_values(ws)
         if not records or len(records) < 2:
             return []
         headers = [h.strip() for h in records[0]]
@@ -216,7 +269,7 @@ class SheetsRepository:
         if not rows:
             return
         ws = self.get_worksheet("Search Keywords")
-        current = len(ws.get_all_values())
+        current = len(self._read_all_values(ws))
         self.ensure_grid_rows(ws, current + len(rows) + 1)
         self._execute_with_retry(
             lambda: ws.append_rows(rows, value_input_option="RAW")
@@ -226,7 +279,7 @@ class SheetsRepository:
     def load_master_entities(self, sheet_name: str) -> List[Tuple[str, List[str]]]:
         """Loads Canonical Name and Aliases from Master Top University/Organizer sheets."""
         ws = self.get_worksheet(sheet_name)
-        records = ws.get_all_values()
+        records = self._read_all_values(ws)
         entities = []
         for row in records[1:]:
             if not row or not row[0].strip():
@@ -239,7 +292,7 @@ class SheetsRepository:
     def load_eligibility_rules_with_categories(self) -> List[Tuple[str, str]]:
         """Loads active rules as list of (Category, Rule Text) from Eligibility Rules sheet."""
         ws = self.get_worksheet("Eligibility Rules")
-        records = ws.get_all_values()
+        records = self._read_all_values(ws)
         rules = []
         for row in records[1:]:
             if len(row) >= 4 and row[3].strip().upper() in ("TRUE", "1", "AKTIF", "YES"):
@@ -271,9 +324,24 @@ class SheetsRepository:
                     continue
         return highest
 
-    def load_all_competition_records(self) -> Tuple[List[CompetitionRecord], int, int]:
+    @staticmethod
+    def _bottom_most_filled_row(rows: List[List[str]]) -> int:
+        """1-based index of the lowest row with data in columns A-O (excluding D)."""
+        bottom_row = 1  # Header is row 1
+        for idx, row in enumerate(rows[1:], start=2):
+            row_cells_no_d = [c for i, c in enumerate(row) if i != 3]
+            if any(bool(c.strip()) for c in row_cells_no_d):
+                bottom_row = idx
+        return bottom_row
+
+    def load_all_competition_records(
+        self, rows: Optional[List[List[str]]] = None
+    ) -> Tuple[List[CompetitionRecord], int, int]:
         """
         Reads all existing rows from Competition Report.
+
+        `rows` may be passed when the caller already read the sheet, so one logical
+        operation costs one API read (Fix 2).
 
         Returns:
         - records: CompetitionRecord list; `row_idx` is the real 1-based sheet row.
@@ -281,17 +349,13 @@ class SheetsRepository:
         - bottom_most_filled_row: 1-based index of the lowest filled row (A-O, excluding D).
         """
         ws = self.get_worksheet("Competition Report")
-        rows = ws.get_all_values()
+        if rows is None:
+            rows = self._read_all_values(ws)
         records: List[CompetitionRecord] = []
         highest_num = self._highest_competition_num_from_values(rows)
-        bottom_row = 1  # Header is row 1
+        bottom_row = self._bottom_most_filled_row(rows)
 
         for idx, row in enumerate(rows[1:], start=2):
-            row_cells_no_d = [c for i, c in enumerate(row) if i != 3]
-            is_filled = any(bool(c.strip()) for c in row_cells_no_d)
-            if is_filled:
-                bottom_row = idx
-
             if not any(bool(c.strip()) for c in row):
                 continue
 
@@ -346,7 +410,7 @@ class SheetsRepository:
             raise ValueError(f"Invalid Competition Report row index: {row_idx}")
 
         ws = self.get_worksheet("Competition Report")
-        all_vals = ws.get_all_values()
+        all_vals = self._read_all_values(ws)
         existing_val = ""
         if len(all_vals) >= row_idx and all_vals[row_idx - 1]:
             existing_val = str(all_vals[row_idx - 1][0]).strip()
@@ -384,7 +448,7 @@ class SheetsRepository:
         Returns the number of IDs newly assigned.
         """
         ws = self.get_worksheet("Competition Report")
-        rows = ws.get_all_values()
+        rows = self._read_all_values(ws)
         missing_rows: List[int] = []
 
         for idx, row in enumerate(rows[1:], start=2):
@@ -427,9 +491,10 @@ class SheetsRepository:
 
         ws = self.get_worksheet("Competition Report")
 
+        # ONE read, reused for the bottom row, the used IDs and the highest number.
         # Re-read immediately before writing: admins may have added rows during a long run.
-        _, _highest, current_bottom = self.load_all_competition_records()
-        all_vals = ws.get_all_values()
+        all_vals = self._read_all_values(ws)
+        _records, _highest, current_bottom = self.load_all_competition_records(all_vals)
         target_start = max(current_bottom + 1, start_row or 0)
 
         while len(all_vals) >= target_start:
@@ -476,7 +541,7 @@ class SheetsRepository:
     def load_system_log_index(self) -> Dict[str, Dict[str, Any]]:
         """Loads all Post IDs from System Log with their real sheet row."""
         ws = self.get_worksheet("System Log")
-        rows = ws.get_all_values()
+        rows = self._read_all_values(ws)
         index: Dict[str, Dict[str, Any]] = {}
         for idx, row in enumerate(rows[1:], start=2):
             if not row or not row[0].strip():
@@ -587,7 +652,7 @@ class SheetsRepository:
     def append_execution_log(self, record: ExecutionLogRecord):
         """Appends exactly one row to Execution Log."""
         ws = self.get_worksheet("Execution Log")
-        current = len(ws.get_all_values())
+        current = len(self._read_all_values(ws))
         self.ensure_grid_rows(ws, current + 2)
         self._execute_with_retry(
             lambda: ws.append_row(record.to_row(), value_input_option="RAW")

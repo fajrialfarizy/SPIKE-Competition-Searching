@@ -17,10 +17,10 @@ python -m unittest templates.test_grade_parity -v
 Result of the last run:
 
 ```
-Ran 91 tests in 6.861s
+Ran 127 tests in 7.177s
 OK
 
-Ran 3 tests in 0.003s
+Ran 4 tests in 0.012s
 OK (skipped=1)
 ```
 
@@ -53,6 +53,21 @@ OK (skipped=1)
 
 ---
 
+## 1c. Round 2 fixes (Fix 1–6)
+
+| Fix | What was fixed | Proof (test) | Status |
+|---|---|---|---|
+| 1 — Grade formula parity | The alias pattern is built from `FLATTEN(range)` → `SPLIT(…",")` → `TRIM` → 1-D `FILTER`, so comma-separated aliases (`UI, BEM UI`) behave like `load_master_entities`. The silent `IFERROR(…,"[^\s\S]")` is gone; only a genuinely empty master range is handled explicitly with `IF(COUNTA(range)=0, …)`. A Skala/Mode outside the PRD sets now yields `Unknown` in both the sheet and the oracle. The compiled pattern lives in one generated cell per master sheet (`Grade Rules`!F2:G3) exposed as the named ranges `TOP_UNIV_PATTERN` / `TOP_ORG_PATTERN`, so D2 references a name instead of inlining the expression in every branch (7 311 → 3 570 characters, measured by the test). `populate_template` installs or refreshes D2 only after both named ranges are confirmed to exist; if `addNamedRange` failed or was skipped, D2 is left untouched with one actionable warning instead of a Grade column full of `#NAME?`. | `test_template_builder.TestGradeFormula.test_alias_cells_are_comma_split_before_filtering`, `test_empty_master_range_is_handled_explicitly_without_iferror`, `test_empty_aliases_are_filtered_out`, `test_unrecognized_skala_and_mode_become_unknown`, `test_d2_references_the_named_ranges_instead_of_inlining_the_pattern`; `test_template_builder.TestPopulateTemplate.test_grade_pattern_helpers_and_named_ranges_are_installed`, `test_grade_pattern_helpers_are_idempotent_and_never_overwrite_admin_text`, `test_d2_is_not_written_when_the_named_ranges_cannot_be_created`, `test_d2_is_installed_on_the_next_run_once_the_named_ranges_exist`; `templates.test_grade_parity.TestOracleMatchesPrdTable.test_oracle_matches_expected_for_all_combinations` (240 combinations incl. `Regional` / `TBD`) and `test_multiple_aliases_punctuation_and_empty_alias` | Passed (automated, mocked); live evaluation of the named ranges is `Not tested (needs real services)` |
+| 1 (live) | Formula evaluated by a real Google Sheets TEST spreadsheet | `templates.test_grade_parity.TestLiveSheetParity` | Not tested (needs real services) |
+| 2 — Sheets rate limits | Worksheet handles cached per title (invalidated after `add_rows`/error), every read goes through `_execute_with_retry`, 429 / `RESOURCE_EXHAUSTED` / "Quota exceeded" use 15/30/60 s + jitter while 403 stays permanent, and `append_competition_records` reads the sheet once for bottom row + used IDs + highest number. | `test_sheets_safety.TestSheetsRateLimits.test_quota_error_retries_with_15s_and_30s_backoff`, `test_resource_exhausted_text_also_uses_the_long_backoff`, `test_permission_denied_is_permanent_and_not_retried`, `test_worksheet_handles_are_cached`, `test_append_competition_records_reads_the_sheet_once`; `test_pipeline.TestSheetsCallBudget.test_calls_per_processed_post_stay_within_budget` (budget: ≤ 4 Sheets calls per processed post; measured marginal cost in the worst case where every post creates a new competition row: 3.0) | Passed (automated, mocked); real quota behaviour `Not tested (needs real services)` |
+| 3 — Pagination completeness | `ApifyScraperClient` returns `(posts, raw_count)`; "exhausted" is decided from the RAW item count, never the date-filtered count. | `test_pipeline.TestRawCountPagination.test_pinned_old_post_does_not_make_a_saturated_page_look_exhausted` (page 1 = 20 raw with 2 pinned old posts → next page requested, all 18 in-window posts stored) | Passed (automated, mocked) |
+| 4 — D17 attempt limit | `max_failed_run_attempts` (Config, default 3) + `compmon/retry_policy.py` marker `[attempts=N]` inside `Error Notes`; dead posts are skipped, cost no cap, do not count as failed and do not force `Partial`; `GeminiPermanentError` and Sheets errors consume no attempt; Execution Log reports dead posts. | `test_pipeline.TestExtractionRetriesD17.test_post_dies_after_three_failed_runs_and_run_four_is_success`, `test_dead_post_does_not_use_the_per_run_cap`, `test_reset_dead_post_to_pending_makes_it_eligible_again`, `test_sheets_write_error_does_not_consume_an_attempt`, `test_keyword_evaluation_still_only_counts_success`; `test_compmon.TestRetryPolicy`; `test_compmon.TestConfig.test_max_failed_run_attempts_must_be_a_positive_integer` | Passed (automated, mocked) |
+| 5 — D18 checkpoint | `checkpoint_should_advance(...)` replaces `should_update_checkpoint(status)`; the checkpoint records the run start time and advances when scraping coverage is complete, independent of extraction outcome, but only if at least one source actually FINISHED (rule (d) is literal: `total_sources > 0` requires `completed_sources >= 1`). | `test_pipeline.TestCheckpointD18.test_extraction_failure_advances_checkpoint_and_next_routine_asks_for_new_posts_only`, `test_all_sources_erroring_keeps_the_checkpoint`, `test_failed_source_keeps_its_original_from_date_and_runs_first`, `test_keyword_run_counter_advances_on_a_partial_routine`, `test_partial_run_with_one_completed_source_still_advances`; `test_invalid_api_key_halts_and_leaves_remaining_posts_pending`; `test_ceiling_hit_records_pending_and_marks_partial` and `test_cap_hit_defers_posts_and_forces_partial` now assert the checkpoint stays empty; `test_dropped_pending_entries_force_partial` still asserts no advance | Passed (automated, mocked) |
+| 6A — Apify cost experiment | Opt-in notebook cell (one account, two runs 20 vs `MAX_TEST_RESULTS`, cost fields printed, "unknown" when missing) | `notebooks/test_apify_actors_phase0.ipynb` cell 4 | Not tested (needs real services) |
+| 6B — Configurable first limit | `account_start_limit_initial` / `account_start_limit_routine` (default 20, clamped to the ceiling) feed the FIRST `resultsLimit`; escalation and ceiling unchanged. | `test_pipeline.TestAccountPagination.test_start_limit_100_finishes_a_45_post_account_in_one_call`, `test_routine_uses_its_own_start_limit`, existing `test_account_with_more_than_one_page_reaches_success` (default 20/40/60); `test_compmon.TestConfig.test_account_start_limits_default_validate_and_clamp` | Passed (automated, mocked) |
+
+---
+
 ## 2. PRD / regression coverage
 
 | Area | Module under test | Proof | Status |
@@ -78,6 +93,8 @@ OK (skipped=1)
 | Live Gemini extraction | Needs a Gemini API key / quota | Run notebook 01/02 with Colab Secrets |
 | Live Google Sheets writes, protected ranges and permissions | Needs a real spreadsheet and OAuth | Run `templates/build_template.py` + notebook 01 against a TEST spreadsheet |
 | Grade formula parity on a real spreadsheet | Needs a real TEST spreadsheet (ARRAYFORMULA evaluation) | `COMPMON_TEST_SPREADSHEET_ID=<test sheet id> python -m unittest templates.test_grade_parity -v` |
+| Apify account-pagination cost (resultsLimit 20 vs large, `usageTotalUsd`) | Needs a paid Apify token and burns credits | `notebooks/test_apify_actors_phase0.ipynb` section 4 (set `RUN_COST_EXPERIMENT = True`) |
+| Google Sheets quota/backoff against the real API | Needs a real spreadsheet and enough traffic to hit 60 rpm | Run notebook 01/02 against a TEST spreadsheet |
 
 Never point these at the production spreadsheet.
 
@@ -88,5 +105,7 @@ Never point these at the production spreadsheet.
 - The keyword actor is reset per run (no `pageId` continuation: the actor requires `NEXT_PAGE_ID` from its key-value store, which the wrapper does not read). Pagination therefore uses documented `dateFrom`/`dateTo` windows; verified actor inputs are documented in `compmon/apify_client.py`.
 - The keyword actor ranks results by relevance, not by date. Splitting the window narrows the result set but cannot guarantee that every historical post inside the window is returned; the ceiling reason in `pending_ranges` makes such a source visible to the admin instead of silently claiming success.
 - The Grade formula reads rules, grades and criteria from `Grade Rules`, but **adding a new rule row requires re-running `populate_template`** (the branch order is generated from Priority). This is documented in the template docstring.
-- A run that ends with leftover `Pending`/`Failed` rows from earlier runs is reported `Partial` even though it wrote no new pending range; those rows are retried on the next run.
+- A run that ends with leftover `Pending`/`Failed` rows from earlier runs is reported `Partial` even though it wrote no new pending range; those rows are retried on the next run, except posts that reached `max_failed_run_attempts` (dead, D17).
+- The Grade formula depends on the named ranges `TOP_UNIV_PATTERN` / `TOP_ORG_PATTERN` over `Grade Rules`!G2:G3. If they cannot be created (no edit permission, or the names already exist elsewhere), `populate_template` writes the D1 header but leaves D2 empty and logs one warning with the fix; re-running the cell after the names exist installs the formula.
+- The D18 checkpoint means `Partial` does not by itself imply "checkpoint unchanged". A `Partial` run caused only by extraction failures still advances it, so the next Routine run does not re-scrape (and re-pay for) the window. A `Partial` run in which NO source finished (every source errored, the only source hit `max_results_ceiling_per_source`, or was deferred by the 100-post cap) leaves the checkpoint unchanged even when posts were stored; the deferred source is retried first next run, and a single-source run stuck at the ceiling needs the ceiling raised before the checkpoint can advance.
 - `templates/test_grade_parity.py` is outside `tests/`, so `unittest discover tests` does not collect its live test; it is listed separately above.

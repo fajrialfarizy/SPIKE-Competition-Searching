@@ -6,6 +6,7 @@ All tests call production `SheetsRepository` against the gspread-6-shaped fakes.
 
 import unittest
 from typing import List
+from unittest import mock
 
 from compmon.models import CompetitionRecord, SystemLogRecord
 from compmon.sheets_repo import SheetsRepository
@@ -165,16 +166,104 @@ class TestSystemLogWrites(unittest.TestCase):
     def test_failed_write_retries_three_times_then_raises(self):
         self.ws.fail_times = 3
         with self.assertRaises(RuntimeError) as ctx:
-            self.repo.append_raw_posts_to_system_log([self._record("abc123", "caption")])
+            self.repo.update_system_log_status(
+                row_idx=2, processing_status="Success", processed_at_iso="",
+                eligibility_status="", competition_id="", error_notes="",
+            )
         self.assertIn("failed after 3 retries", str(ctx.exception))
         # Nothing was partially written.
-        self.assertEqual(len(self.ws.data), 1)
+        self.assertEqual(self.ws.data, [SYS_HEADERS])
+
+    def test_transient_read_failure_is_retried_before_the_append(self):
+        """Reads now go through `_execute_with_retry` too, so one bad read is recovered."""
+        self.ws.fail_times = 1
+        with mock.patch("compmon.sheets_repo.time.sleep"):
+            self.repo.append_raw_posts_to_system_log([self._record("abc123", "caption")])
+        self.assertEqual(self.ws.data[-1][0], "abc123")
 
     def test_duplicate_post_id_is_not_written_twice(self):
         self.repo.append_raw_posts_to_system_log([self._record("dup1", "first")])
         self.repo.append_raw_posts_to_system_log([self._record("dup1", "second")])
         ids = [r[0] for r in self.ws.data[1:]]
         self.assertEqual(ids, ["dup1"])
+
+
+class TestSheetsRateLimits(unittest.TestCase):
+    """Fix 2: worksheet-handle caching and the long quota backoff."""
+
+    def setUp(self):
+        self.client = FakeClient({"System Log": [SYS_HEADERS]})
+        self.repo = SheetsRepository(self.client, "test_spreadsheet_id")
+        self.ws = self.repo.get_worksheet("System Log")
+
+    def test_quota_error_retries_with_15s_and_30s_backoff(self):
+        self.ws.fail_times = 2
+        self.ws.fail_message = "429 Quota exceeded for quota metric 'Read requests'"
+
+        with mock.patch("compmon.sheets_repo.time.sleep") as sleep_mock:
+            index = self.repo.load_system_log_index()
+
+        self.assertEqual(index, {})
+        delays = [call.args[0] for call in sleep_mock.call_args_list]
+        self.assertEqual(len(delays), 2)
+        self.assertGreaterEqual(delays[0], 15.0)
+        self.assertLessEqual(delays[0], 16.0)
+        self.assertGreaterEqual(delays[1], 30.0)
+        self.assertLessEqual(delays[1], 31.0)
+
+    def test_resource_exhausted_text_also_uses_the_long_backoff(self):
+        self.ws.fail_times = 1
+        self.ws.fail_message = "RESOURCE_EXHAUSTED: Write requests per minute exceeded"
+
+        with mock.patch("compmon.sheets_repo.time.sleep") as sleep_mock:
+            self.repo.update_system_log_status(
+                row_idx=2, processing_status="Success", processed_at_iso="",
+                eligibility_status="", competition_id="", error_notes="",
+            )
+
+        self.assertEqual(sleep_mock.call_count, 1)
+        self.assertGreaterEqual(sleep_mock.call_args.args[0], 15.0)
+
+    def test_permission_denied_is_permanent_and_not_retried(self):
+        self.ws.fail_times = 3
+        self.ws.fail_message = "403 PERMISSION_DENIED: no access"
+
+        with mock.patch("compmon.sheets_repo.time.sleep") as sleep_mock:
+            with self.assertRaises(Exception):
+                self.repo.load_system_log_index()
+
+        self.assertEqual(sleep_mock.call_count, 0)
+
+    def test_worksheet_handles_are_cached(self):
+        client = FakeClient({"System Log": [SYS_HEADERS]})
+        repo = SheetsRepository(client, "test_spreadsheet_id")
+        calls = {"n": 0}
+        original = client.spreadsheet.worksheet
+
+        def counting(title):
+            calls["n"] += 1
+            return original(title)
+
+        client.spreadsheet.worksheet = counting
+        for _ in range(5):
+            repo.get_worksheet("System Log")
+        self.assertEqual(calls["n"], 1)
+
+    def test_append_competition_records_reads_the_sheet_once(self):
+        comp_client = FakeClient({
+            "Competition Report": [COMP_HEADERS],
+            "System Log": [SYS_HEADERS],
+        })
+        repo = SheetsRepository(comp_client, "test_spreadsheet_id")
+        comp_ws = repo.get_worksheet("Competition Report")
+        reads_before = comp_ws.api_calls
+
+        rec = CompetitionRecord(competition_id="", nama_lomba="One", jenis_lomba="Essay")
+        repo.append_competition_records([rec])
+
+        # 1 read + 1 batch write, instead of read + read + write.
+        self.assertEqual(comp_ws.api_calls - reads_before, 2)
+        self.assertEqual(rec.competition_id, "CMP-000001")
 
 
 if __name__ == "__main__":

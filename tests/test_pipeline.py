@@ -13,6 +13,7 @@ from compmon.models import RawPost
 from compmon.pipeline import CompetitionPipeline
 from compmon.sheets_repo import SheetsRepository
 from compmon.checkpoint import parse_pending_ranges
+from compmon.retry_policy import parse_attempts
 from compmon.eligibility import evaluate_eligibility_and_deadline
 from compmon.models import AIExtractionResult, EligibilityStatus
 from compmon.gemini_extractor import GeminiExtractor, GeminiPermanentError
@@ -84,36 +85,60 @@ class WindowApify:
 
     - accounts honor `resultsLimit` and `onlyPostsNewerThan` (like `apify/instagram-scraper`);
     - keywords honor `maxPostsPerKeyword`, `dateFrom` and `dateTo` (like
-      `seemuapps/instagram-keyword-posts-scraper`).
+      `seemuapps/instagram-keyword-posts-scraper`);
+    - both return `(posts_inside_window, raw_item_count)` like `ApifyScraperClient`. The raw
+      count is measured BEFORE the Python date filter, so posts listed in `pinned` (older
+      than the cutoff but still returned by the actor) do not shrink it.
     """
 
-    def __init__(self, account_posts=None, keyword_posts=None):
+    def __init__(self, account_posts=None, keyword_posts=None, pinned=None):
         self.account_posts = account_posts or {}
         self.keyword_posts = keyword_posts or {}
+        self.pinned = set(pinned or [])
         self.account_calls = []
+        self.account_cutoffs = []
         self.keyword_calls = []
         self.client = None
 
+    def _ordered(self, posts):
+        """Pinned posts first, then the rest newest-first (actor order, not date order)."""
+        pinned = sorted([p for p in posts if p.post_id in self.pinned],
+                        key=lambda p: p.posted_at, reverse=True)
+        normal = sorted([p for p in posts if p.post_id not in self.pinned],
+                        key=lambda p: p.posted_at, reverse=True)
+        return pinned + normal
+
     def scrape_account_posts(self, actor_id, account_username, results_limit, only_posts_newer_than=None):
         self.account_calls.append((account_username, results_limit))
-        posts = sorted(self.account_posts.get(account_username, []),
-                       key=lambda p: p.posted_at, reverse=True)
+        self.account_cutoffs.append(only_posts_newer_than)
+        items = self._ordered(list(self.account_posts.get(account_username, [])))[:results_limit]
+        raw_count = len(items)
         if only_posts_newer_than:
             cutoff = date.fromisoformat(str(only_posts_newer_than)[:10])
-            posts = [p for p in posts if p.posted_at.date() >= cutoff]
-        return posts[:results_limit]
+            items = [p for p in items if p.posted_at.date() >= cutoff]
+        return items, raw_count
 
     def scrape_keyword_posts(self, actor_id, keyword, max_posts, date_from=None, date_to=None):
         self.keyword_calls.append((keyword, max_posts, date_from, date_to))
-        posts = self.keyword_posts.get(keyword, [])
+        posts = list(self.keyword_posts.get(keyword, []))
         if date_from:
             start = date.fromisoformat(str(date_from)[:10])
             posts = [p for p in posts if p.posted_at.date() >= start]
         if date_to:
             end = date.fromisoformat(str(date_to)[:10])
             posts = [p for p in posts if p.posted_at.date() <= end]
-        posts = sorted(posts, key=lambda p: p.posted_at, reverse=True)
-        return posts[:max_posts]
+        items = self._ordered(posts)[:max_posts]
+        return items, len(items)
+
+
+class ErrorApify(WindowApify):
+    """Every actor run fails (outage simulation)."""
+
+    def scrape_account_posts(self, *args, **kwargs):
+        raise RuntimeError("Apify actor run failed with status: FAILED")
+
+    def scrape_keyword_posts(self, *args, **kwargs):
+        raise RuntimeError("Apify actor run failed with status: FAILED")
 
 
 def make_post(post_id: str, days_ago: int = 5, caption: str = "Lomba bisnis",
@@ -132,10 +157,11 @@ def make_post(post_id: str, days_ago: int = 5, caption: str = "Lomba bisnis",
 
 class PipelineTestCase(unittest.TestCase):
     def build(self, apify, gemini_behavior, competition_rows=None, system_log_rows=None,
-              notebook="INITIAL", row_count=2000):
+              notebook="INITIAL", row_count=2000, run_state_rows=None):
         rows = {
             "Competition Report": competition_rows,
             "System Log": system_log_rows,
+            "Run State": run_state_rows,
         }
         rows = {k: v for k, v in rows.items() if v is not None}
         client = FakeClient(rows, row_count=row_count)
@@ -198,6 +224,52 @@ class TestAccountPagination(PipelineTestCase):
         self.assertTrue(state["global_checkpoint"])
         self.assertEqual(parse_pending_ranges(state["pending_ranges"]), [])
 
+    def test_start_limit_100_finishes_a_45_post_account_in_one_call(self):
+        """Fix 6B: the first resultsLimit is configurable; 45 posts fit in one run."""
+        posts = [make_post(f"start_{i:03d}", days_ago=i + 1, account="lombabisnis")
+                 for i in range(45)]
+        apify = WindowApify({"lombabisnis": posts})
+        client, repo, pipeline = self.build(apify, self.success_gemini)
+        self.assertEqual(pipeline.config.account_start_limit_initial, 20)
+        self.assertEqual(pipeline.config.account_start_limit_routine, 20)
+        pipeline.config.account_start_limit_initial = 100
+        pipeline.config.max_results_per_input = 20
+        pipeline.config.max_results_ceiling_per_source = 200
+
+        summary = pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+
+        self.assertEqual([limit for _, limit in apify.account_calls], [100])
+        self.assertEqual(summary["new_posts"], 45)
+        self.assertEqual(summary["status"], "Success")
+
+    def test_routine_uses_its_own_start_limit(self):
+        posts = [make_post(f"rstart_{i:03d}", days_ago=i + 1, account="lombabisnis")
+                 for i in range(45)]
+        apify = WindowApify({"lombabisnis": posts})
+        run_state = [
+            ["Key", "Value", "Updated At"],
+            ["global_checkpoint",
+             (NOW - timedelta(days=90)).isoformat(), ""],
+            ["pending_ranges", "[]", ""],
+            ["keyword_run_counter", "0", ""],
+        ]
+        client, repo, pipeline = self.build(
+            apify, self.success_gemini, system_log_rows=[SYS_HEADERS],
+            run_state_rows=run_state,
+        )
+        pipeline.config.account_start_limit_initial = 20
+        pipeline.config.account_start_limit_routine = 100
+        pipeline.config.max_results_ceiling_per_source = 200
+
+        summary = pipeline.run_routine_scraping()
+
+        lombabisnis_calls = [limit for acc, limit in apify.account_calls
+                             if acc == "lombabisnis"]
+        self.assertEqual(lombabisnis_calls, [100])
+        self.assertEqual(summary["new_posts"], 45)
+
     def test_ceiling_hit_records_pending_and_marks_partial(self):
         """Task 23: reaching the ceiling leaves the source unfinished and the run Partial."""
         posts = [make_post(f"acct_many_{i:03d}", days_ago=i + 1, account="lombabisnis")
@@ -216,6 +288,8 @@ class TestAccountPagination(PipelineTestCase):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0].source, "lombabisnis")
         self.assertIn("max_results_ceiling_per_source=40", pending[0].reason)
+        # D18 (d): this run had a single source and it did not finish (ceiling reached, so
+        # `completed_sources == 0`), which counts as an outage for the checkpoint rule.
         self.assertEqual(state["global_checkpoint"], "")
 
 
@@ -310,6 +384,8 @@ class TestNewPostCap(PipelineTestCase):
         self.assertTrue(pending)
         self.assertEqual(pending[0].source, "lombabisnis")
         self.assertIn("post baru per run", pending[0].reason)
+        # D18 (d): the only source was deferred by the cap, so no source completed and the
+        # checkpoint stays empty; the deferred source is re-scraped first next run.
         self.assertEqual(state["global_checkpoint"], "")
 
     def test_second_run_finishes_the_deferred_source_and_sets_the_checkpoint(self):
@@ -505,7 +581,12 @@ class TestGeminiBehaviourInPipeline(PipelineTestCase):
         self.assertEqual(statuses, ["Pending", "Pending", "Success"])
         self.assertEqual(calls["n"], 2)
         self.assertEqual(summary["status"], "Partial")
-        self.assertEqual(repo.load_run_state()["global_checkpoint"], "")
+        # D17: a permanent Gemini error consumes no attempt.
+        for pid in ("g_1", "g_2"):
+            self.assertEqual(index[pid]["error_notes"], "")
+            self.assertEqual(parse_attempts(index[pid]["error_notes"]), 0)
+        # D18: the halt does not block the checkpoint - the scraping coverage is complete.
+        self.assertTrue(repo.load_run_state()["global_checkpoint"])
 
     def test_gemini_delay_is_applied_between_calls_only(self):
         client, repo, pipeline = self.build(
@@ -705,6 +786,337 @@ class TestPendingMergeWiring(PipelineTestCase):
 
         self.assertEqual(summary["status"], "Partial")
         self.assertEqual(repo.load_run_state()["global_checkpoint"], "")
+
+
+class TestRawCountPagination(PipelineTestCase):
+
+    def test_pinned_old_post_does_not_make_a_saturated_page_look_exhausted(self):
+        """
+        Fix 3: page 1 returns 20 raw items of which 2 are pinned posts older than the
+        cut-off, so only 18 survive the Python date filter. Completeness must use the RAW
+        count (20 == limit), otherwise the run would stop early and lose 18 posts.
+        """
+        window_posts = [make_post(f"win_{i:02d}", days_ago=i + 1, account="lombabisnis")
+                        for i in range(18)]
+        old_posts = [make_post("pin_old_1", days_ago=120, account="lombabisnis"),
+                     make_post("pin_old_2", days_ago=130, account="lombabisnis")]
+        apify = WindowApify({"lombabisnis": window_posts + old_posts},
+                            pinned={"pin_old_1", "pin_old_2"})
+        client, repo, pipeline = self.build(apify, self.success_gemini)
+        pipeline.config.max_results_per_input = 20
+        pipeline.config.max_results_ceiling_per_source = 200
+
+        summary = pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+
+        self.assertEqual([limit for _, limit in apify.account_calls], [20, 40])
+        self.assertEqual(summary["new_posts"], 18)
+        self.assertEqual(len(repo.load_system_log_index()), 18)
+        self.assertEqual(summary["status"], "Success")
+
+
+class TestExtractionRetriesD17(PipelineTestCase):
+
+    @staticmethod
+    def _dead_row(post_id: str, attempts: int = 3) -> list:
+        row = build_system_log_row(post_id, status="Failed")
+        row[12] = f"Extraction Error: Gemini extraction failed after 3 attempts [attempts={attempts}]"
+        return row
+
+    def test_post_dies_after_three_failed_runs_and_run_four_is_success(self):
+        posts = [make_post("stuck_post", days_ago=1, account="lombabisnis")]
+        apify = WindowApify({"lombabisnis": posts})
+        calls = {"n": 0}
+
+        def broken(model, contents, config):
+            calls["n"] += 1
+            return MockGeminiResponse("THIS IS NOT JSON {")
+
+        client, repo, pipeline = self.build(
+            apify, broken, system_log_rows=[SYS_HEADERS]
+        )
+        pipeline.config.gemini_max_retries = 1
+        pipeline.config.max_failed_run_attempts = 3
+
+        for expected_attempt in (1, 2, 3):
+            with self.subTest(attempt=expected_attempt):
+                summary = pipeline.run_initial_scraping(
+                    selected_accounts=["lombabisnis"], selected_keywords=[]
+                )
+                info = repo.load_system_log_index()["stuck_post"]
+                self.assertEqual(summary["status"], "Partial")
+                self.assertEqual(summary["failed_posts"], 1)
+                self.assertEqual(info["processing_status"], "Failed")
+                self.assertEqual(parse_attempts(info["error_notes"]), expected_attempt)
+
+        self.assertEqual(calls["n"], 3)
+
+        fourth = pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+        info = repo.load_system_log_index()["stuck_post"]
+        exec_log = repo.get_worksheet("Execution Log").data
+
+        self.assertEqual(fourth["status"], "Success")
+        self.assertEqual(fourth["failed_posts"], 0)
+        self.assertEqual(fourth["dead_posts"], 1)
+        self.assertEqual(calls["n"], 3, "a dead post must not call Gemini again")
+        self.assertEqual(info["processing_status"], "Failed")
+        self.assertEqual(parse_attempts(info["error_notes"]), 3)
+        self.assertIn("1 posts permanently failed (attempts>=3), see System Log", exec_log[-1][10])
+
+    def test_dead_post_does_not_use_the_per_run_cap(self):
+        sys_rows = [SYS_HEADERS, self._dead_row("dead_post"),
+                    build_system_log_row("live_post", status="Pending")]
+        apify = WindowApify({"lombabisnis": []})
+        client, repo, pipeline = self.build(
+            apify, self.success_gemini, system_log_rows=sys_rows
+        )
+        pipeline.config.max_new_posts_per_run = 1
+
+        summary = pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+
+        index = repo.load_system_log_index()
+        self.assertEqual(summary["status"], "Success")
+        self.assertEqual(summary["dead_posts"], 1)
+        self.assertEqual(index["live_post"]["processing_status"], "Success")
+        self.assertEqual(index["dead_post"]["processing_status"], "Failed")
+
+    def test_reset_dead_post_to_pending_makes_it_eligible_again(self):
+        """Admin recovery (documented in docs/ADMIN_GUIDE.md)."""
+        sys_rows = [SYS_HEADERS, self._dead_row("dead_post")]
+        apify = WindowApify({"lombabisnis": []})
+        client, repo, pipeline = self.build(
+            apify, self.success_gemini, system_log_rows=sys_rows
+        )
+
+        ws = repo.get_worksheet("System Log")
+        ws.data[1][8] = "Pending"    # Processing Status
+        ws.data[1][12] = ""          # clear the [attempts=3] marker
+
+        summary = pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+
+        index = repo.load_system_log_index()
+        self.assertEqual(summary["dead_posts"], 0)
+        self.assertEqual(index["dead_post"]["processing_status"], "Success")
+
+    def test_sheets_write_error_does_not_consume_an_attempt(self):
+        """A Sheets failure must propagate as a fatal run error, not as a failed attempt."""
+        posts = [make_post("write_fail_post", days_ago=1, account="lombabisnis")]
+        apify = WindowApify({"lombabisnis": posts})
+        client, repo, pipeline = self.build(
+            apify, self.success_gemini, system_log_rows=[SYS_HEADERS]
+        )
+        ws = repo.get_worksheet("System Log")
+        # Row 2 is the only post: make its status write fail permanently.
+        ws.fail_ranges = {"I2:M2"}
+
+        with mock.patch("compmon.sheets_repo.time.sleep"):
+            with self.assertRaises(RuntimeError):
+                pipeline.run_initial_scraping(
+                    selected_accounts=["lombabisnis"], selected_keywords=[]
+                )
+
+        values = self.repo_row(ws, 2)
+        self.assertEqual(values[8], "Pending")   # Processing Status unchanged
+        self.assertEqual(values[12], "")         # no [attempts=N] marker
+        self.assertEqual(parse_attempts(values[12]), 0)
+
+    @staticmethod
+    def repo_row(ws, row_idx: int):
+        row = list(ws.data[row_idx - 1])
+        return row
+
+    def test_keyword_evaluation_still_only_counts_success(self):
+        """A dead post stays `Failed`, so keyword metrics ignore it."""
+        from compmon.keyword_eval import calculate_keyword_metrics
+
+        rows = [
+            {"processing_status": "Success", "keyword_source": "kw",
+             "eligibility_status": "Eligible", "competition_id": "CMP-1"},
+            {"processing_status": "Failed", "keyword_source": "kw",
+             "eligibility_status": "", "competition_id": ""},
+        ]
+        metrics = calculate_keyword_metrics(rows, {"CMP-1": "Valid"}, ["kw"], min_reviewed=1)
+        self.assertEqual(metrics["kw"]["total_found"], 1)
+        self.assertEqual(metrics["kw"]["total_reviewed"], 1)
+        self.assertEqual(metrics["kw"]["valid_count"], 1)
+        self.assertEqual(metrics["kw"]["invalid_count"], 0)
+
+
+class TestCheckpointD18(PipelineTestCase):
+
+    @staticmethod
+    def _run_state_rows(checkpoint="", counter="0"):
+        return [
+            ["Key", "Value", "Updated At"],
+            ["global_checkpoint", checkpoint, ""],
+            ["pending_ranges", "[]", ""],
+            ["keyword_run_counter", counter, ""],
+        ]
+
+    def test_extraction_failure_advances_checkpoint_and_next_routine_asks_for_new_posts_only(self):
+        posts = [make_post("failing_post", days_ago=1, account="lombabisnis")]
+        apify = WindowApify({"lombabisnis": posts})
+        calls = {"n": 0}
+
+        def broken(model, contents, config):
+            calls["n"] += 1
+            return MockGeminiResponse("THIS IS NOT JSON {")
+
+        client, repo, pipeline = self.build(
+            apify, broken, system_log_rows=[SYS_HEADERS]
+        )
+        pipeline.config.gemini_max_retries = 1
+
+        first = pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+        checkpoint = repo.load_run_state()["global_checkpoint"]
+        checkpoint_date = checkpoint.split("T")[0]
+
+        self.assertEqual(first["status"], "Partial")
+        self.assertTrue(first["checkpoint_advanced"])
+        self.assertTrue(checkpoint)
+
+        calls_before = calls["n"]
+        apify.account_calls.clear()
+        apify.account_cutoffs.clear()
+
+        second = pipeline.run_routine_scraping()
+
+        self.assertEqual(second["status"], "Partial")
+        # The failed post is retried from System Log ...
+        self.assertEqual(calls["n"], calls_before + 1)
+        # ... and no account is asked to scrape the old window again.
+        self.assertTrue(apify.account_cutoffs)
+        self.assertTrue(all(c == checkpoint_date for c in apify.account_cutoffs))
+        self.assertEqual(
+            repo.load_system_log_index()["failing_post"]["processing_status"], "Failed"
+        )
+
+    def test_partial_run_with_one_completed_source_still_advances(self):
+        """(d) is satisfied as soon as ONE source completed, even when another is deferred."""
+        posts = [make_post(f"mixed_{i:02d}", days_ago=i + 1, account="lombabisnis")
+                 for i in range(30)]
+        apify = WindowApify({"lombabisnis": posts})
+        client, repo, pipeline = self.build(apify, self.success_gemini)
+        pipeline.config.max_results_per_input = 20
+        pipeline.config.max_results_ceiling_per_source = 20
+
+        # acc_b finishes (no posts), lombabisnis hits the ceiling -> 1 of 2 sources done.
+        summary = pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis", "acc_b"], selected_keywords=[]
+        )
+
+        state = repo.load_run_state()
+        self.assertEqual(summary["status"], "Partial")
+        self.assertEqual(len(parse_pending_ranges(state["pending_ranges"])), 1)
+        self.assertTrue(state["global_checkpoint"])
+
+    def test_all_sources_erroring_keeps_the_checkpoint(self):
+        apify = ErrorApify()
+        client, repo, pipeline = self.build(apify, self.success_gemini)
+
+        summary = pipeline.run_initial_scraping(
+            selected_accounts=["acc_a", "acc_b"], selected_keywords=[]
+        )
+
+        state = repo.load_run_state()
+        pending = parse_pending_ranges(state["pending_ranges"])
+        self.assertEqual(summary["status"], "Partial")
+        self.assertEqual(sorted(p.source for p in pending), ["acc_a", "acc_b"])
+        self.assertEqual(state["global_checkpoint"], "")
+
+    def test_failed_source_keeps_its_original_from_date_and_runs_first(self):
+        posts = [make_post(f"many_{i:03d}", days_ago=i + 1, account="lombabisnis")
+                 for i in range(60)]
+        apify = WindowApify({"lombabisnis": posts})
+        client, repo, pipeline = self.build(apify, self.success_gemini)
+        pipeline.config.max_results_per_input = 20
+        pipeline.config.max_results_ceiling_per_source = 40
+
+        pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+        original_from = parse_pending_ranges(
+            repo.load_run_state()["pending_ranges"]
+        )[0].from_date
+        self.assertTrue(original_from)
+
+        apify.account_calls.clear()
+        apify.account_cutoffs.clear()
+        pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+
+        pending_again = parse_pending_ranges(repo.load_run_state()["pending_ranges"])
+        self.assertEqual(pending_again[0].source, "lombabisnis")
+        self.assertEqual(pending_again[0].from_date, original_from)
+        self.assertEqual(apify.account_calls[0][0], "lombabisnis")
+        self.assertEqual(apify.account_cutoffs[0], original_from)
+
+    def test_keyword_run_counter_advances_on_a_partial_routine(self):
+        posts = [make_post(f"busy_{i}", days_ago=2, keyword="lomba bmc") for i in range(10)]
+        apify = WindowApify(keyword_posts={"lomba bmc": posts})
+        client, repo, pipeline = self.build(
+            apify, self.success_gemini,
+            run_state_rows=self._run_state_rows(
+                checkpoint="2026-11-01T00:00:00+00:00", counter="0"
+            ),
+        )
+        self.add_keyword(repo, "lomba bmc")
+        pipeline.config.max_results_per_input = 2
+        pipeline.config.max_results_ceiling_per_source = 4
+
+        summary = pipeline.run_routine_scraping()
+
+        state = repo.load_run_state()
+        self.assertEqual(summary["status"], "Partial")
+        self.assertNotEqual(state["global_checkpoint"], "2026-11-01T00:00:00+00:00")
+        self.assertEqual(state["keyword_run_counter"], "1")
+
+
+class TestSheetsCallBudget(PipelineTestCase):
+    """
+    Fix 2 budget: after a processed post the pipeline may issue at most 4 Sheets API calls
+    (one Competition Report read + one A:C/E:O batch write + one System Log status write).
+    The fixed per-run overhead is identical for both runs, so the difference isolates the
+    per-post cost.
+    """
+
+    def _api_calls_for(self, post_count: int) -> int:
+        """Worst case: every post becomes a NEW competition row (read + append + status)."""
+        posts = [make_post(f"budget_{i:02d}", days_ago=i + 1, account="lombabisnis")
+                 for i in range(post_count)]
+        apify = WindowApify({"lombabisnis": posts})
+        client, repo, pipeline = self.build(
+            apify, self.success_gemini, system_log_rows=[SYS_HEADERS]
+        )
+        seen = {"n": 0}
+
+        def unique(model, contents, config):
+            seen["n"] += 1
+            return MockGeminiResponse(extraction_json(nama_lomba=f"Lomba Budget {seen['n']}"))
+
+        pipeline.gemini = GeminiExtractor("key", client=MockGenAIClient(unique))
+        pipeline.run_initial_scraping(
+            selected_accounts=["lombabisnis"], selected_keywords=[]
+        )
+        return client.spreadsheet.api_calls
+
+    def test_calls_per_processed_post_stay_within_budget(self):
+        small = self._api_calls_for(4)
+        large = self._api_calls_for(12)
+        per_post = (large - small) / 8.0
+
+        self.assertGreater(per_post, 0)
+        self.assertLessEqual(per_post, 4, f"{per_post} Sheets calls per processed post")
 
 
 if __name__ == "__main__":

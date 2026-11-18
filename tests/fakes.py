@@ -39,8 +39,12 @@ class GridLimitError(ValueError):
 
 class FakeWorksheet:
     def __init__(self, title: str, data: Optional[List[List[str]]] = None,
-                 rows: int = SHEET_ROWS, cols: int = SHEET_COLS, sheet_id: int = 1):
+                 rows: int = SHEET_ROWS, cols: int = SHEET_COLS, sheet_id: int = 1,
+                 workbook: Any = None):
         self.title = title
+        self.workbook = workbook
+        # Every outward API call (read or write) is counted so tests can assert a budget.
+        self.api_calls = 0
         self.data = [list(r) for r in (data or [])]
         self._rows = rows
         self._cols = cols
@@ -52,6 +56,14 @@ class FakeWorksheet:
         self.added_rows = 0
         self.fail_times = 0
         self.fail_message = "503 Service Unavailable backend error"
+        # Ranges whose write must fail (used to prove that a Sheets write error does not
+        # consume an extraction attempt).
+        self.fail_ranges = set()
+
+    def _count_api_call(self):
+        self.api_calls += 1
+        if self.workbook is not None:
+            self.workbook.api_calls += 1
 
     # -- gspread geometry ---------------------------------------------------
     @property
@@ -63,6 +75,7 @@ class FakeWorksheet:
         return self._cols
 
     def add_rows(self, rows: int):
+        self._count_api_call()
         self._rows += rows
         self.added_rows += rows
 
@@ -71,9 +84,12 @@ class FakeWorksheet:
 
     # -- reads --------------------------------------------------------------
     def get_all_values(self) -> List[List[str]]:
+        self._count_api_call()
+        self._maybe_fail()
         return [list(r) for r in self.data]
 
     def col_values(self, col: int) -> List[str]:
+        self._count_api_call()
         return [row[col - 1] if len(row) >= col else "" for row in self.data]
 
     # -- write plumbing -----------------------------------------------------
@@ -104,13 +120,17 @@ class FakeWorksheet:
             self.data[row - 1].append("")
 
     def update(self, values=None, range_name: Optional[str] = None,
-               value_input_option: Optional[str] = None, **kwargs):
+               value_input_option: Optional[str] = None, _count: bool = True, **kwargs):
         # gspread 6.1.4 signature: update(values, range_name=None, ...)
         if range_name is None:
             range_name = kwargs.get("range_name")
         if values is None:
             values = kwargs.get("values")
+        if _count:
+            self._count_api_call()
         self._maybe_fail()
+        if range_name and range_name in self.fail_ranges:
+            raise Exception("503 Service Unavailable backend error")
         # A real Sheets write of a formula needs USER_ENTERED; data writes must stay RAW.
         has_formula = any(
             isinstance(cell, str) and cell.startswith("=")
@@ -131,12 +151,15 @@ class FakeWorksheet:
         return {}
 
     def batch_update(self, data, value_input_option: Optional[str] = None, **kwargs):
+        # One HTTP request, so it counts as one API call (the inner updates are local).
+        self._count_api_call()
         self._record("batch", value_input_option, allow_user_entered=False)
         for item in data:
             self.update(
                 values=item["values"],
                 range_name=item["range"],
                 value_input_option=value_input_option,
+                _count=False,
             )
         return {}
 
@@ -147,6 +170,7 @@ class FakeWorksheet:
         self._append(values, value_input_option)
 
     def _append(self, rows, value_input_option):
+        self._count_api_call()
         self._maybe_fail()
         self._record("append", value_input_option, allow_user_entered=False)
         for values in rows:
@@ -176,7 +200,12 @@ class FakeSpreadsheet:
         self._worksheets: Dict[str, FakeWorksheet] = {}
         self.requests: List[Dict[str, Any]] = []
         self.protected: Dict[int, List[Dict[str, Any]]] = {}
+        self.named_ranges: Dict[str, Dict[str, Any]] = {}
+        # Set to an error message to make addNamedRange fail like a real API rejection.
+        self.named_range_error: Optional[str] = None
         self._next_protected_id = 1000
+        # Total API calls (reads + writes + worksheet lookups) for budget assertions.
+        self.api_calls = 0
 
         if empty:
             return
@@ -188,29 +217,38 @@ class FakeSpreadsheet:
                 if name not in ("Competition Report", "System Log", "Execution Log"):
                     rows += [list(r) for r in content["rows"]]
             self._worksheets[name] = FakeWorksheet(
-                name, rows, rows=row_count, sheet_id=len(self._worksheets) + 1
+                name, rows, rows=row_count, sheet_id=len(self._worksheets) + 1,
+                workbook=self,
             )
 
         # Custom sheets used by tests that are not part of the template.
         for name, rows in (worksheet_rows or {}).items():
             if name not in self._worksheets:
                 self._worksheets[name] = FakeWorksheet(
-                    name, rows, rows=row_count, sheet_id=len(self._worksheets) + 1
+                    name, rows, rows=row_count, sheet_id=len(self._worksheets) + 1,
+                    workbook=self,
                 )
 
     def worksheets(self):
         return list(self._worksheets.values())
 
     def worksheet(self, title: str):
+        # A worksheet lookup is a metadata API call in gspread.
+        self.api_calls += 1
         return self._worksheets[title]
 
     def add_worksheet(self, title: str, rows: int, cols: int, index: Optional[int] = None):
-        ws = FakeWorksheet(title, [], rows=rows, cols=cols, sheet_id=len(self._worksheets) + 1)
+        self.api_calls += 1
+        ws = FakeWorksheet(title, [], rows=rows, cols=cols, sheet_id=len(self._worksheets) + 1,
+                           workbook=self)
         self._worksheets[title] = ws
         return ws
 
     def list_protected_ranges(self, sheetid: int):
         return list(self.protected.get(sheetid, []))
+
+    def list_named_ranges(self):
+        return list(self.named_ranges.values())
 
     def batch_update(self, body: Dict[str, Any]):
         self.requests.append(body)
@@ -226,6 +264,16 @@ class FakeSpreadsheet:
                 rid = request["deleteProtectedRange"]["protectedRangeId"]
                 for sheet_id, items in self.protected.items():
                     self.protected[sheet_id] = [i for i in items if i["protectedRangeId"] != rid]
+            elif "addNamedRange" in request:
+                if self.named_range_error:
+                    raise Exception(self.named_range_error)
+                named = dict(request["addNamedRange"]["namedRange"])
+                if named["name"] in self.named_ranges:
+                    raise Exception(
+                        f"INVALID_ARGUMENT: a named range with the name {named['name']} already exists"
+                    )
+                named["namedRangeId"] = f"nr_{len(self.named_ranges) + 1}"
+                self.named_ranges[named["name"]] = named
         return {}
 
 

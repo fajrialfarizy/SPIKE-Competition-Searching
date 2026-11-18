@@ -15,6 +15,12 @@ Key guarantees:
   never added, and the JSON is kept small (entry cap + reason truncation).
 - Task 28/29: the pipeline never writes to a worksheet. Competition IDs are assigned by
   `sheets_repo` from the real sheet row (`row_idx`), refreshing the highest number first.
+- Fix 3: a source is "exhausted" only when the RAW actor item count is below the requested
+  limit, never from the post-date-filtered count (pinned old posts are not progress).
+- D17: a post may fail extraction at most `max_failed_run_attempts` runs; after that it is
+  dead (not processed, no cap budget, no `failed_posts`, no `Partial`).
+- D18: `global_checkpoint` records scraping coverage (run start time, UTC), so extraction
+  failures and cap-deferred posts no longer force a re-scrape of the whole window.
 """
 
 import logging
@@ -37,9 +43,10 @@ from compmon.dedup import deduplicate_post_batch, partition_new_and_existing
 from compmon.matcher import match_competition_record
 from compmon.eligibility import evaluate_eligibility_and_deadline
 from compmon.checkpoint import (
-    parse_pending_ranges, serialize_pending_ranges, should_update_checkpoint,
+    parse_pending_ranges, serialize_pending_ranges, checkpoint_should_advance,
     merge_pending_ranges, group_pending_by_source, _pending_key
 )
+from compmon.retry_policy import parse_attempts, next_attempt, set_attempts, is_dead
 from compmon.exec_log import generate_execution_id, format_iso_wib, determine_execution_status
 from compmon.quota import ExecutionSafetyTracker, check_apify_quota_available
 
@@ -166,24 +173,31 @@ class CompetitionPipeline:
         cutoff_date: str,
         existing_post_ids: Set[str],
         safety: ExecutionSafetyTracker,
+        start_limit: Optional[int] = None,
     ) -> Tuple[List[RawPost], bool, str]:
         """
         Scrapes one account, escalating `resultsLimit` by `max_results_per_input` until the
-        actor returns fewer rows than requested (source exhausted) or the configured ceiling
-        is reached (Task 23). The actor has no upper date bound, so the date cut-off is
-        re-applied in Python by the Apify client and duplicates are collapsed by Post ID.
+        actor returns fewer RAW items than requested (source exhausted) or the configured
+        ceiling is reached (Task 23). The actor has no upper date bound, so the date cut-off
+        is re-applied in Python by the Apify client and duplicates are collapsed by Post ID.
+
+        `start_limit` is the FIRST `resultsLimit` (default `max_results_per_input`, i.e. the
+        historical behaviour); it is clamped to the ceiling. Fix 3: completeness is decided
+        from the raw item count, never from the post-date-filter count, so pinned old posts
+        cannot make a saturated run look exhausted.
 
         Returns (posts, is_done, reason).
         """
         step = self.config.max_results_per_input
         ceiling = self.config.max_results_ceiling_per_source
-        current_limit = step
+        first = int(start_limit) if start_limit else step
+        current_limit = max(1, min(first, ceiling))
         all_posts: List[RawPost] = []
         seen_ids: Set[str] = set()
 
         while True:
             try:
-                batch = self.apify.scrape_account_posts(
+                batch, raw_count = self.apify.scrape_account_posts(
                     actor_id=self.config.apify_actor_accounts,
                     account_username=acc,
                     results_limit=current_limit,
@@ -202,7 +216,7 @@ class CompetitionPipeline:
             if budget_blocked:
                 return all_posts, False, self._budget_reason(f"account '{acc}'")
 
-            if len(batch) < current_limit:
+            if raw_count < current_limit:
                 return all_posts, True, ""
 
             next_limit = current_limit + step
@@ -227,7 +241,7 @@ class CompetitionPipeline:
         date_from = d_from.isoformat()
         date_to = d_to.isoformat()
         try:
-            batch = self.apify.scrape_keyword_posts(
+            batch, raw_count = self.apify.scrape_keyword_posts(
                 actor_id=self.config.apify_actor_keyword,
                 keyword=kw,
                 max_posts=limit,
@@ -245,9 +259,10 @@ class CompetitionPipeline:
 
         if budget_blocked:
             ctx.budget_blocked = True
-            return len(batch), False, self._budget_reason(f"keyword '{kw}'")
+            return raw_count, False, self._budget_reason(f"keyword '{kw}'")
 
-        return len(batch), len(batch) < limit, ""
+        # Completeness uses the RAW item count, never the date-filtered count (Fix 3).
+        return raw_count, raw_count < limit, ""
 
     def _scrape_keyword_window(
         self,
@@ -336,6 +351,7 @@ class CompetitionPipeline:
         keyword_tasks: List[Tuple[str, str]],
         existing_pending: List[PendingRange],
         existing_post_ids: Set[str],
+        account_start_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Scrapes every source needed by this run:
@@ -381,9 +397,13 @@ class CompetitionPipeline:
         completed_sources = 0
         budget_blocked = False
         today_str = str(datetime.now(self.tz).date())
+        # Source accounting for the checkpoint rule (D18).
+        attempted_sources: List[Tuple[str, str]] = []
+        completed_source_keys: Set[Tuple[str, str]] = set()
 
         for stype, source, from_date, pending_keys in tasks:
             label = f"{stype.lower()} '{source}'"
+            attempted_sources.append((stype, source))
             if not safety.can_accept_more_posts():
                 budget_blocked = True
                 new_pending_ranges.append(
@@ -394,7 +414,8 @@ class CompetitionPipeline:
 
             if stype == "Account":
                 posts, done, reason = self._scrape_account_with_pagination(
-                    source, from_date or account_cutoff, existing_post_ids, safety
+                    source, from_date or account_cutoff, existing_post_ids, safety,
+                    start_limit=account_start_limit,
                 )
             elif stype == "Keyword":
                 posts, done, reason = self._scrape_keyword_with_pagination(
@@ -408,6 +429,7 @@ class CompetitionPipeline:
 
             if done:
                 completed_sources += 1
+                completed_source_keys.add((stype, source))
                 completed_pending_keys.update(pending_keys)
             else:
                 if "post baru per run" in reason:
@@ -422,6 +444,8 @@ class CompetitionPipeline:
             "new_pending_ranges": new_pending_ranges,
             "completed_sources": completed_sources,
             "total_sources": len(tasks),
+            "attempted_sources": attempted_sources,
+            "completed_source_keys": completed_source_keys,
             "safety": safety,
             "budget_blocked": budget_blocked,
         }
@@ -489,6 +513,7 @@ class CompetitionPipeline:
                 keyword_tasks=keyword_tasks,
                 existing_pending=existing_pending,
                 existing_post_ids=existing_post_ids,
+                account_start_limit=self.config.account_start_limit_initial,
             )
 
             pending_merge = merge_pending_ranges(
@@ -508,6 +533,9 @@ class CompetitionPipeline:
                 # Dropped unfinished entries must never look like a clean run.
                 hit_limit=scrape["budget_blocked"] or pending_merge.dropped,
                 is_routine=False,
+                dropped_pending_entries=pending_merge.dropped_entries,
+                attempted_sources=scrape["attempted_sources"],
+                completed_source_keys=scrape["completed_source_keys"],
             )
 
         except Exception as fatal_e:
@@ -612,6 +640,7 @@ class CompetitionPipeline:
                 keyword_tasks=[(kw["Keyword"], cutoff_date) for kw in sorted_due_kws],
                 existing_pending=existing_pending,
                 existing_post_ids=existing_post_ids,
+                account_start_limit=self.config.account_start_limit_routine,
             )
 
             pending_merge = merge_pending_ranges(
@@ -631,6 +660,9 @@ class CompetitionPipeline:
                 hit_limit=scrape["budget_blocked"] or pending_merge.dropped,
                 is_routine=True,
                 current_run_counter=run_counter,
+                dropped_pending_entries=pending_merge.dropped_entries,
+                attempted_sources=scrape["attempted_sources"],
+                completed_source_keys=scrape["completed_source_keys"],
             )
 
         except Exception as fatal_e:
@@ -657,6 +689,36 @@ class CompetitionPipeline:
             raise
 
     # =========================================================================
+    # Decision D17: which System Log rows are still eligible for processing
+    # =========================================================================
+
+    def _select_posts_to_process(
+        self, sys_index: Dict[str, Dict[str, Any]]
+    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], int]:
+        """
+        Returns (eligible posts, number of dead posts).
+
+        Eligible = `Pending` posts PLUS `Failed` posts whose attempt counter is still below
+        `max_failed_run_attempts`. A `Failed` post at or above the limit is dead: it is not
+        processed, does not use cap budget, is not counted as a failed post and does not
+        force `Partial`. An admin can revive it by setting the status back to `Pending` and
+        clearing the `[attempts=N]` marker.
+        """
+        max_attempts = self.config.max_failed_run_attempts
+        eligible: List[Tuple[str, Dict[str, Any]]] = []
+        dead = 0
+        for pid, info in sys_index.items():
+            status = info.get("processing_status", "")
+            if status == ProcessingStatus.PENDING.value:
+                eligible.append((pid, info))
+            elif status == ProcessingStatus.FAILED.value:
+                if is_dead(status, info.get("error_notes", ""), max_attempts):
+                    dead += 1
+                else:
+                    eligible.append((pid, info))
+        return eligible, dead
+
+    # =========================================================================
     # _process_collected_posts
     # =========================================================================
 
@@ -672,6 +734,9 @@ class CompetitionPipeline:
         hit_limit: bool = False,
         is_routine: bool = False,
         current_run_counter: int = 0,
+        dropped_pending_entries: int = 0,
+        attempted_sources: Optional[List[Tuple[str, str]]] = None,
+        completed_source_keys: Optional[Set[Tuple[str, str]]] = None,
     ) -> Dict[str, Any]:
         """Core data ingestion, persistence, AI extraction, and matching pipeline."""
         deduped = deduplicate_post_batch(scraped_posts)
@@ -712,10 +777,10 @@ class CompetitionPipeline:
         # Reload the index so newly written rows are included.
         sys_index = self.repo.load_system_log_index()
 
-        all_unprocessed = [
-            (pid, info) for pid, info in sys_index.items()
-            if info["processing_status"] in (ProcessingStatus.PENDING.value, ProcessingStatus.FAILED.value)
-        ]
+        # (c) of D18: the checkpoint may only move once every new post is really stored.
+        new_posts_written = all(str(p.post_id) in sys_index for p in brand_new)
+
+        all_unprocessed, dead_count = self._select_posts_to_process(sys_index)
 
         limit_cap = self.config.max_new_posts_per_run
         posts_to_process = all_unprocessed[:limit_cap]
@@ -745,6 +810,9 @@ class CompetitionPipeline:
             if idx > 0 and self.config.gemini_delay_seconds > 0:
                 time.sleep(self.config.gemini_delay_seconds)
 
+            # Only extraction/validation problems consume an attempt (D17). Sheets calls
+            # below are outside this try: their errors are retried by `_execute_with_retry`
+            # or propagate as a fatal run error, leaving status/attempts untouched.
             try:
                 extracted, date_validation_notes = self.gemini.extract_competition_info(
                     caption=caption,
@@ -754,96 +822,95 @@ class CompetitionPipeline:
                     max_retries=self.config.gemini_max_retries,
                     delay_seconds=self.config.gemini_delay_seconds,
                 )
-
                 elig_status, elig_note = evaluate_eligibility_and_deadline(extracted, today_wib)
-                processed_at_wib = format_iso_wib(datetime.now(timezone.utc), self.config.timezone)
-
                 all_notes_list = [elig_note] + date_validation_notes
-
-                if elig_status == EligibilityStatus.INELIGIBLE:
-                    # D4/PRD 7.4: System Log only, never Competition Report.
-                    self.repo.update_system_log_status(
-                        row_idx=row_idx,
-                        processing_status=ProcessingStatus.SUCCESS.value,
-                        processed_at_iso=processed_at_wib,
-                        eligibility_status=elig_status.value,
-                        competition_id="",
-                        error_notes="; ".join(all_notes_list),
-                    )
-                    success_count += 1
-                    continue
-
                 matched_id, _both_empty, match_note, unid_idx = match_competition_record(
                     extracted, existing_comps
                 )
-
-                final_comp_id = matched_id or ""
-                if match_note:
-                    all_notes_list.append(match_note)
-                final_notes = "; ".join(all_notes_list)
-
-                if unid_idx is not None and not matched_id:
-                    # Task 28: a matched admin row without an ID gets one via sheets_repo only.
-                    matched_row = existing_comps[unid_idx]
-                    assigned_id = self.repo.assign_next_competition_id(matched_row.row_idx)
-                    if assigned_id:
-                        matched_row.competition_id = assigned_id
-                        final_comp_id = assigned_id
-                        logger.info(
-                            f"Assigned ID {assigned_id} to matched manual row {matched_row.row_idx}"
-                        )
-                    else:
-                        all_notes_list.append("ID baris manual gagal diberikan (sel sudah terisi)")
-                        final_notes = "; ".join(all_notes_list)
-
-                elif not matched_id and not final_comp_id:
-                    new_comp = CompetitionRecord(
-                        competition_id="",  # assigned by sheets_repo from the live sheet
-                        nama_lomba=extracted.nama_lomba or "",
-                        jenis_lomba=extracted.competition_type or "",
-                        universitas=extracted.universitas or "",
-                        penyelenggara=extracted.penyelenggara or "",
-                        skala=extracted.skala or "",
-                        pelaksanaan_final=extracted.pelaksanaan_final or "",
-                        tempat_final=extracted.tempat_final or "",
-                        tanggal_mulai_registrasi=extracted.tanggal_mulai_registrasi or "",
-                        deadline_pendaftaran=extracted.deadline_pendaftaran or "",
-                        link_postingan=info.get("url", ""),
-                        link_registrasi=extracted.link_registrasi or "",
-                        link_guidebook=extracted.link_guidebook or "",
-                        status_pemeriksaan="Belum Diperiksa",
-                    )
-                    self.repo.append_competition_records([new_comp])
-                    existing_comps.append(new_comp)
-                    final_comp_id = new_comp.competition_id
-
-                self.repo.update_system_log_status(
-                    row_idx=row_idx,
-                    processing_status=ProcessingStatus.SUCCESS.value,
-                    processed_at_iso=processed_at_wib,
-                    eligibility_status=elig_status.value,
-                    competition_id=final_comp_id,
-                    error_notes=final_notes,
-                )
-                success_count += 1
-
             except GeminiPermanentError as perm_e:
-                # Invalid API key / daily quota: stop immediately, leave the rest Pending.
+                # Invalid API key / daily quota: stop immediately, leave the rest Pending and
+                # do NOT consume an attempt for the current post (D17).
                 logger.error(f"Permanent Gemini error on post {pid}: {perm_e}")
                 halted = True
                 break
-
             except Exception as e:
                 logger.error(f"Failed processing post {pid}: {e}")
                 failed_count += 1
+                attempts = next_attempt(info.get("error_notes", ""))
                 self.repo.update_system_log_status(
                     row_idx=row_idx,
                     processing_status=ProcessingStatus.FAILED.value,
                     processed_at_iso=format_iso_wib(datetime.now(timezone.utc), self.config.timezone),
                     eligibility_status="",
                     competition_id="",
-                    error_notes=f"Extraction Error: {str(e)}",
+                    error_notes=set_attempts(f"Extraction Error: {e}", attempts),
                 )
+                continue
+
+            processed_at_wib = format_iso_wib(datetime.now(timezone.utc), self.config.timezone)
+
+            if elig_status == EligibilityStatus.INELIGIBLE:
+                # D4/PRD 7.4: System Log only, never Competition Report.
+                self.repo.update_system_log_status(
+                    row_idx=row_idx,
+                    processing_status=ProcessingStatus.SUCCESS.value,
+                    processed_at_iso=processed_at_wib,
+                    eligibility_status=elig_status.value,
+                    competition_id="",
+                    error_notes="; ".join(all_notes_list),
+                )
+                success_count += 1
+                continue
+
+            final_comp_id = matched_id or ""
+            if match_note:
+                all_notes_list.append(match_note)
+            final_notes = "; ".join(all_notes_list)
+
+            if unid_idx is not None and not matched_id:
+                # Task 28: a matched admin row without an ID gets one via sheets_repo only.
+                matched_row = existing_comps[unid_idx]
+                assigned_id = self.repo.assign_next_competition_id(matched_row.row_idx)
+                if assigned_id:
+                    matched_row.competition_id = assigned_id
+                    final_comp_id = assigned_id
+                    logger.info(
+                        f"Assigned ID {assigned_id} to matched manual row {matched_row.row_idx}"
+                    )
+                else:
+                    all_notes_list.append("ID baris manual gagal diberikan (sel sudah terisi)")
+                    final_notes = "; ".join(all_notes_list)
+
+            elif not matched_id and not final_comp_id:
+                new_comp = CompetitionRecord(
+                    competition_id="",  # assigned by sheets_repo from the live sheet
+                    nama_lomba=extracted.nama_lomba or "",
+                    jenis_lomba=extracted.competition_type or "",
+                    universitas=extracted.universitas or "",
+                    penyelenggara=extracted.penyelenggara or "",
+                    skala=extracted.skala or "",
+                    pelaksanaan_final=extracted.pelaksanaan_final or "",
+                    tempat_final=extracted.tempat_final or "",
+                    tanggal_mulai_registrasi=extracted.tanggal_mulai_registrasi or "",
+                    deadline_pendaftaran=extracted.deadline_pendaftaran or "",
+                    link_postingan=info.get("url", ""),
+                    link_registrasi=extracted.link_registrasi or "",
+                    link_guidebook=extracted.link_guidebook or "",
+                    status_pemeriksaan="Belum Diperiksa",
+                )
+                self.repo.append_competition_records([new_comp])
+                existing_comps.append(new_comp)
+                final_comp_id = new_comp.competition_id
+
+            self.repo.update_system_log_status(
+                row_idx=row_idx,
+                processing_status=ProcessingStatus.SUCCESS.value,
+                processed_at_iso=processed_at_wib,
+                eligibility_status=elig_status.value,
+                competition_id=final_comp_id,
+                error_notes=final_notes,
+            )
+            success_count += 1
 
         end_time_utc = datetime.now(timezone.utc)
         end_time_wib = format_iso_wib(end_time_utc, self.config.timezone)
@@ -860,27 +927,41 @@ class CompetitionPipeline:
 
         latest_posting_iso = format_iso_wib(latest_posting_dt, self.config.timezone) if latest_posting_dt else ""
 
+        # Decision D18: the checkpoint describes SCRAPING coverage, not extraction success.
+        # New value = this run's START time (UTC); posts published while the run was scraping
+        # are covered by the next run (Post-ID de-duplication makes them free).
+        checkpoint_advances = checkpoint_should_advance(
+            attempted_sources=attempted_sources or [],
+            completed_source_keys=completed_source_keys or set(),
+            pending_ranges=pending_ranges,
+            dropped_entries=dropped_pending_entries,
+            new_posts_stored=new_posts_written,
+            total_sources=total_sources,
+            completed_sources=completed_sources,
+        )
+
         state_updates = {
             "last_execution_id": execution_id,
             "pending_ranges": serialize_pending_ranges(pending_ranges),
         }
-        if should_update_checkpoint(exec_status):
-            checkpoint_val = (
-                latest_posting_dt.astimezone(timezone.utc).isoformat()
-                if latest_posting_dt
-                else start_time_utc.isoformat()
-            )
-            state_updates["global_checkpoint"] = checkpoint_val
+        if checkpoint_advances:
+            state_updates["global_checkpoint"] = start_time_utc.astimezone(timezone.utc).isoformat()
             if is_routine:
                 state_updates["keyword_run_counter"] = str(current_run_counter + 1)
 
         self.repo.update_run_state(state_updates, end_time_wib)
 
-        errors_notes = ""
+        notes: List[str] = []
         if pending_ranges:
-            errors_notes = f"Pending ranges: {len(pending_ranges)}"
+            notes.append(f"Pending ranges: {len(pending_ranges)}")
         if halted:
-            errors_notes = (errors_notes + "; " if errors_notes else "") + "Dihentikan karena error permanen Gemini"
+            notes.append("Dihentikan karena error permanen Gemini")
+        if dead_count:
+            notes.append(
+                f"{dead_count} posts permanently failed "
+                f"(attempts>={self.config.max_failed_run_attempts}), see System Log"
+            )
+        errors_notes = "; ".join(notes)
 
         exec_rec = ExecutionLogRecord(
             execution_id=execution_id,
@@ -904,6 +985,8 @@ class CompetitionPipeline:
             "new_posts": len(brand_new),
             "successfully_processed": success_count,
             "failed_posts": failed_count,
+            "dead_posts": dead_count,
+            "checkpoint_advanced": checkpoint_advances,
             "latest_posting_timestamp": latest_posting_iso,
         }
         logger.info(f"Execution finished: {summary}")

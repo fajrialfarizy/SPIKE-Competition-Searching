@@ -36,3 +36,39 @@ Dokumen ini mencatat semua keputusan teknis dan desain yang disetujui atau diput
 | D18 | Gemini Python SDK | Menggunakan SDK resmi modern Google GenAI (`google-genai`) dengan Pydantic class `response_schema` dan `response_mime_type="application/json"` untuk ekstraksi structured output JSON anti-halusinasi. |
 | D19 | Penanganan Truncation Caption | Google Sheets memiliki batas sel 50.000 karakter, sedangkan Instagram caption maksimal 2.200 karakter. Jika ada caption anomali > 45.000 karakter, potong pada karakter ke-45.000 dan tambahkan penanda di Error Notes. |
 
+---
+
+### D17 & D18 (Round 2): Keputusan yang Disetujui Pemilik Proyek
+
+> Catatan penomoran: tabel D16 di atas juga memakai nomor D17/D18 untuk item teknis fase 0.
+> Dua keputusan di bawah adalah keputusan pemilik proyek pada ronde perbaikan ini dan ditulis
+> dengan akhiran "(Round 2)" agar tidak tertukar.
+
+#### D17 (Round 2): Batas percobaan ekstraksi per post
+
+| Aspek | Keputusan |
+|---|---|
+| Masalah | Satu post yang selalu gagal (mis. Gemini selalu mengembalikan JSON tidak valid) diulang di setiap run, sehingga setiap run `Partial` dan Routine tidak pernah mengejar ketertinggalan. |
+| Batas | Post boleh gagal paling banyak `max_failed_run_attempts` run (Config, default 3). Setelah itu post menjadi **dead**: tetap `Failed`, tidak diproses otomatis lagi, tidak memakai kuota 100 post, tidak dihitung `failed_posts`, dan tidak memaksa `Partial`. |
+| Penyimpanan counter | Tanpa kolom/sheet baru. Counter disimpan di akhir `Error Notes` System Log sebagai marker machine-readable `[attempts=N]` (`compmon/retry_policy.py`). |
+| Yang dihitung | Hanya kegagalan Gemini/ekstraksi (error API setelah retry, JSON tidak valid, kegagalan validasi/skema). `GeminiPermanentError` (API key salah, kuota harian) **tidak** memakai attempt dan post tetap `Pending`. Error baca/tulis Google Sheets **tidak** memakai attempt: error tersebut di-retry oleh `_execute_with_retry` atau berhenti sebagai error fatal run. |
+| Status run | Run di mana post mencapai kegagalan ke-N tetap `Partial`. Hanya run berikutnya yang bisa `Success` lagi. |
+| Pelaporan | Execution Log `Errors / Notes` menyebut jumlah dead post, mis. `2 posts permanently failed (attempts>=3), see System Log`. |
+| Pemulihan admin | Admin dapat memaksa percobaan ulang dengan mengubah `Processing Status` menjadi `Pending` dan menghapus marker `[attempts=N]` di `Error Notes` (lihat `docs/ADMIN_GUIDE.md`). |
+
+#### D18 (Round 2): Checkpoint = cakupan scraping, bukan keberhasilan ekstraksi
+
+**Keputusan ini secara eksplisit menimpa aturan lama "checkpoint hanya maju bila status eksekusi Success" (PRD 6.2 / 6.13, non-negotiable rule 6 pada brief pertama), dengan persetujuan pemilik proyek.**
+
+| Aspek | Keputusan |
+|---|---|
+| Alasan | Apify dibayar per hasil. Run Routine mingguan yang hanya `Partial` karena satu post gagal Gemini membuat checkpoint tertahan, sehingga run berikutnya mengulang seluruh window yang makin panjang dan membayar Apify lagi untuk post yang sudah tersimpan. |
+| Prinsip | Checkpoint menggambarkan **cakupan scraping**. Post mentah sudah ditulis ke System Log SEBELUM pemrosesan AI (rule 5), dan percobaan ulang ekstraksi membaca System Log (`Pending`, atau `Failed` dengan attempt < batas), jadi tidak perlu scraping ulang. |
+| Syarat maju | Checkpoint maju hanya bila SEMUA terpenuhi: (a) setiap sumber yang dicoba pada run ini selesai di-scrape atau tercatat di `pending_ranges` dengan `from` sendiri; (b) merge `pending_ranges` tidak menjatuhkan entri (`dropped_entries == 0`); (c) setiap post baru benar-benar tersimpan di System Log; (d) bukan outage: bila `total_sources > 0` maka `completed_sources >= 1` — literal, minimal satu sumber harus SELESAI di-scrape pada run ini. Konsekuensi yang disengaja: run yang satu-satunya sumbernya tertunda kuota 100 post, atau mentok `max_results_ceiling_per_source`, TIDAK memajukan checkpoint walaupun post-nya tersimpan; sumber itu tercatat di `pending_ranges` dengan `from` aslinya dan dijalankan pertama pada run berikutnya. |
+| Tidak lagi memblokir | Kegagalan ekstraksi Gemini, dead post (D17), halt `GeminiPermanentError`, dan post yang belum diproses karena cap pemrosesan (tetap `Pending`). |
+| Nilai baru | Waktu MULAI run (UTC ISO), bukan waktu posting terbaru. Post yang terbit selama run berjalan dicakup run berikutnya; Post-ID dedup membuatnya gratis. |
+| Status eksekusi | Definisi `Success`/`Partial`/`Failed` tidak berubah, hanya untuk pelaporan. `Partial` tidak lagi berarti checkpoint tetap. |
+| Sumber belum selesai | Tetap di `pending_ranges` dengan `from` miliknya (cutoff yang dipakai run itu, bukan "hari ini"). Run berikutnya mengambil sumber tersebut lebih dulu, bukan seluruh window. |
+| Frequency | `keyword_run_counter` naik setiap kali checkpoint maju, bukan hanya saat `Success`. |
+| D13 | Tidak berubah: Routine tetap menolak berjalan bila checkpoint kosong. |
+

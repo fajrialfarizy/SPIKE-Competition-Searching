@@ -17,11 +17,15 @@ from typing import Dict, List, Optional, Tuple
 
 from compmon.grading_support import calculate_grade
 
+# The master sheets may hold several comma-separated aliases per row (`UI, BEM UI`), an
+# alias with punctuation, and an empty alias cell. The sheet formula must split on "," and
+# ignore empty aliases exactly like the oracle.
 TOP_UNIVERSITIES = [
-    ("Universitas Indonesia", ["UI"]),
+    ("Universitas Indonesia", ["UI", "BEM UI", ""]),
     ("Universitas Gadjah Mada", ["UGM"]),
     ("Universitas Airlangga", ["UNAIR"]),
     ("Institut Teknologi Bandung", ["ITB"]),
+    ("Universitas Padjadjaran", ["UNPAD", "Unpad (Jatinangor)"]),
 ]
 TOP_ORGANIZERS = [
     ("Unilever", []), ("Gojek", []), ("Huawei", []), ("Pertamina", []), ("Tokopedia", []),
@@ -29,11 +33,13 @@ TOP_ORGANIZERS = [
 
 ENTITIES = {
     "Top University": ("BEM Universitas Indonesia", "Universitas Indonesia"),
+    "Top University via second alias": ("BEM UI", "Fakultas Ekonomi"),
+    "Top University via punctuation alias": ("Panitia Unpad (Jatinangor)", ""),
     "Top Organizer": ("PT Pertamina", ""),
     "none": ("Himpunan Kampus Daerah", "Universitas Lokal"),
 }
-SKALAS = ["Nasional", "Internasional"]
-MODES = ["Online", "Offline", "Hybrid"]
+SKALAS = ["Nasional", "Internasional", "Regional"]
+MODES = ["Online", "Offline", "Hybrid", "TBD"]
 MISSING = [None, "penyelenggara", "skala", "mode"]
 
 
@@ -44,14 +50,28 @@ def expected_grade(entity: str, skala: str, mode: str, missing: Optional[str]) -
     """
     if missing:
         return "Unknown"
+    # The sheet formula now agrees with the oracle: values outside the PRD sets are Unknown.
+    if skala not in ("Nasional", "Internasional"):
+        return "Unknown"
+    if mode not in ("Online", "Offline", "Hybrid"):
+        return "Unknown"
     is_intl = skala == "Internasional"
     effective_mode = "Offline" if mode in ("Offline", "Hybrid") else "Online"
 
-    if entity == "Top University" and (is_intl or effective_mode == "Offline"):
+    is_top_university = entity in (
+        "Top University",
+        # The same university reached through its 2nd alias and through an alias with
+        # punctuation: the sheet formula must split the alias cell and match phrases.
+        "Top University via second alias",
+        "Top University via punctuation alias",
+    )
+    is_top_organizer = entity == "Top Organizer"
+
+    if is_top_university and (is_intl or effective_mode == "Offline"):
         return "Advance"
-    if entity == "Top Organizer" and (effective_mode == "Offline" or is_intl):
+    if is_top_organizer and (effective_mode == "Offline" or is_intl):
         return "Advance"
-    if entity in ("Top University", "Top Organizer") and effective_mode == "Online":
+    if (is_top_university or is_top_organizer) and effective_mode == "Online":
         return "Professional"
     if is_intl:
         return "Intermediate"
@@ -84,7 +104,32 @@ def build_matrix() -> List[Dict[str, str]]:
     return matrix
 
 
-TEST_ROWS = build_matrix()
+def _extra_row(entity: str, penyelenggara: str, universitas: str, skala: str, mode: str,
+               expected: str) -> Dict[str, str]:
+    return {
+        "entity": entity,
+        "penyelenggara": penyelenggara,
+        "universitas": universitas,
+        "skala": skala,
+        "pelaksanaan_final": mode,
+        "missing": "",
+        "expected": expected,
+    }
+
+
+# Sample rows for the multi-alias / punctuation-alias / empty-alias / unrecognised-value rules.
+MULTI_ALIAS_ROWS = [
+    _extra_row("alias_bem_ui", "BEM UI", "Fakultas Ekonomi", "Nasional", "Online",
+               "Professional"),
+    _extra_row("alias_punctuation", "Panitia Unpad (Jatinangor)", "", "Internasional",
+               "Online", "Advance"),
+    _extra_row("empty_alias_never_matches", "Himpunan Kampus Daerah", "Universitas Lokal",
+               "Nasional", "Online", "Beginner"),
+    _extra_row("unknown_skala", "BEM UI", "", "Regional", "Online", "Unknown"),
+    _extra_row("unknown_mode", "BEM UI", "", "Nasional", "TBD", "Unknown"),
+]
+
+TEST_ROWS = build_matrix() + MULTI_ALIAS_ROWS
 
 
 class TestOracleMatchesPrdTable(unittest.TestCase):
@@ -107,7 +152,26 @@ class TestOracleMatchesPrdTable(unittest.TestCase):
                 )
 
     def test_matrix_covers_every_combination(self):
-        self.assertEqual(len(TEST_ROWS), 3 * 2 * 3 * 4)
+        self.assertEqual(
+            len(TEST_ROWS),
+            len(ENTITIES) * len(SKALAS) * len(MODES) * len(MISSING) + len(MULTI_ALIAS_ROWS),
+        )
+
+    def test_multiple_aliases_punctuation_and_empty_alias(self):
+        """The oracle splits aliases the same way the master sheets and the formula do."""
+        for row in MULTI_ALIAS_ROWS:
+            with self.subTest(entity=row["entity"]):
+                self.assertEqual(
+                    calculate_grade(
+                        penyelenggara=row["penyelenggara"],
+                        skala=row["skala"],
+                        pelaksanaan_final=row["pelaksanaan_final"],
+                        universitas=row["universitas"],
+                        top_universities=TOP_UNIVERSITIES,
+                        top_organizers=TOP_ORGANIZERS,
+                    ),
+                    row["expected"],
+                )
 
 
 def write_rows_to_test_spreadsheet(gspread_client, test_spreadsheet_id: str) -> int:
