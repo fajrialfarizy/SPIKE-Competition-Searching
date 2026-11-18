@@ -8,7 +8,7 @@ See `docs/TEST_REPORT.md` for the test names behind each row.
 |---|---|---|---|
 | 1.3 | 5 competition types | `compmon/normalization.py` (`normalize_competition_type`) | Passed (automated, mocked) |
 | 1.4 | Eligibility rules | `compmon/eligibility.py` | Passed (automated, mocked) |
-| 2.1 | Python + Apify + Gemini + Sheets stack | `compmon/`, `requirements.txt` (all pinned) | Passed (automated, mocked) |
+| 2.1 | Python + Apify + Gemini + Sheets stack | `compmon/`, `requirements.txt` (lower bounds; only gspread exact) | Passed (automated, mocked) |
 | 4.1 | Competition Report: 15 columns, append-only, column D never written, RAW writes | `compmon/sheets_repo.py`, `templates/build_template.py` | Passed (automated, mocked) |
 | 4.1 | Grade ARRAYFORMULA (generic rules, non-empty aliases, blank/Unknown, Hybrid=Offline) plus named ranges `TOP_UNIV_PATTERN` / `TOP_ORG_PATTERN` over generated helper cells | `templates/build_template.py` | Passed (automated, mocked) — formula structure and the Python oracle; live sheet evaluation of the formula and named ranges is `Not tested (needs real services)` |
 | 4.1 | Status dropdown, Post ID text format, protected ranges (full sheet, warning-only, idempotent) | `templates/build_template.py` | Passed (automated, mocked); live Google API behaviour is `Not tested (needs real services)` |

@@ -17,10 +17,10 @@ python -m unittest templates.test_grade_parity -v
 Result of the last run:
 
 ```
-Ran 127 tests in 7.177s
+Ran 141 tests in 7.924s
 OK
 
-Ran 4 tests in 0.012s
+Ran 4 tests in 0.008s
 OK (skipped=1)
 ```
 
@@ -68,6 +68,18 @@ OK (skipped=1)
 
 ---
 
+## 1d. Fix 7 — dependency pinning on Colab (Python 3.13)
+
+| Item | What changed | Proof (test) | Status |
+|---|---|---|---|
+| `requirements.txt` | Colab-preinstalled packages now use lower bounds (`google-genai>=1.2`, `google-auth>=2.38`, `google-auth-oauthlib>=1.2`, `pydantic>=2.10`, `python-dateutil>=2.9`), so pip has nothing to downgrade. `gspread` keeps the only exact pin (`==6.1.4`). `apify-client` is `>=1.12,<2`: 1.12.2 declares `apify-shared<2.0.0`, so pip resolves `apify-shared` 1.5.0, which still exports `apify_shared.utils.ignore_docs`. 1.8.1 had no upper bound, so pip installed `apify-shared` 2.x and `from apify_client import ApifyClient` failed. | `test_requirements.TestRequirementsFile.test_preinstalled_colab_packages_are_not_pinned`, `test_only_gspread_uses_an_exact_pin`, `test_apify_client_range_keeps_apify_shared_below_two`, `test_every_runtime_import_is_listed` | Passed (automated, mocked) |
+| API compatibility of the allowed versions | `compmon/apify_client.py` uses `ApifyClient(token)` → `client.actor(id).call(run_input=...)` → `run(dict)['status' / 'defaultDatasetId']` → `client.dataset(id).list_items().items`, all present in apify-client 1.12.2 with apify-shared 1.5.0 (checked in an isolated install of exactly those two versions; `compatibility_problems()` returned an empty list). `compmon/gemini_extractor.py` uses `genai.Client(api_key=...)`, `client.models.generate_content(model=, contents=, config=)`, `types.GenerateContentConfig(system_instruction=, response_mime_type=, response_schema=, temperature=)` and a dict schema with uppercase `OBJECT`/`STRING`/`BOOLEAN`, all accepted by the installed google-genai 1.2.0. No code change was needed. | `compmon.env_check.compatibility_problems()` run against apify-client 1.12.2 + apify-shared 1.5.0 and against google-genai 1.2.0 (local interpreter) | Passed (automated, mocked); the real Gemini HTTP call is `Not tested (needs real services)` |
+| Environment check cell | Every notebook now starts with a cell calling `compmon.env_check.run_environment_check()`: Python version, versions of apify-client / apify-shared / gspread / google-genai / google-auth / pydantic, smoke imports (`ApifyClient`, `google.genai`, `google.genai.types`, `gspread`) and `inspect.signature` / field checks for the methods actually called. Problems are printed and the cell stops with an Indonesian message pointing at the install cell and the restart. | `test_env_check.TestRunEnvironmentCheck.test_problems_are_reported_and_stop_the_cell`, `test_report_lists_python_and_tracked_versions`, `test_parse_requirements_ignores_comments_and_blank_lines`, `test_unsatisfied_requirements_reports_missing_and_too_old` | Passed (automated, mocked) |
+| Smart install cell | `compmon.env_check.ensure_environment()` reads the specifiers from `requirements.txt`, installs only the packages that are missing or outside their specifier (`pip install -q "<name><specifier>"`, `--upgrade` only when the installed version is below the minimum), then prints "Paket baru dipasang. Jalankan Runtime > Restart session, lalu jalankan ulang notebook dari atas." and stops. A pip failure prints the failing package and pip output and raises; no `-r`, no `--force-reinstall`. The old `%pip install -q -r requirements.txt` blocks were removed from all four notebooks. | `test_env_check.TestEnsureEnvironment.test_missing_package_installs_only_that_one`, `test_satisfied_packages_install_nothing`, `test_only_outdated_package_is_upgraded`, `test_pip_failure_raises_with_package_name_and_output`, `test_never_issues_a_blanket_requirements_install`, `test_incompatible_but_installed_environment_raises_without_installing` | Passed (automated, mocked) |
+| Fresh Colab install | `!pip install -r requirements.txt` replaced by the cells above; the real install has not been run in Colab | Paste the Environment check output from a fresh Colab runtime to close this row | Not tested (needs real services) |
+
+---
+
 ## 2. PRD / regression coverage
 
 | Area | Module under test | Proof | Status |
@@ -95,6 +107,7 @@ OK (skipped=1)
 | Grade formula parity on a real spreadsheet | Needs a real TEST spreadsheet (ARRAYFORMULA evaluation) | `COMPMON_TEST_SPREADSHEET_ID=<test sheet id> python -m unittest templates.test_grade_parity -v` |
 | Apify account-pagination cost (resultsLimit 20 vs large, `usageTotalUsd`) | Needs a paid Apify token and burns credits | `notebooks/test_apify_actors_phase0.ipynb` section 4 (set `RUN_COST_EXPERIMENT = True`) |
 | Google Sheets quota/backoff against the real API | Needs a real spreadsheet and enough traffic to hit 60 rpm | Run notebook 01/02 against a TEST spreadsheet |
+| Fresh Colab install of `requirements.txt` and the Environment check / Smart install cells | Needs a fresh Google Colab runtime (Python 3.13); not run here, so the `apify_shared` import failure is only proven fixed by the resolver metadata plus an isolated 1.12.2 + apify-shared 1.5.0 install | Run notebooks 01–03 and `test_apify_actors_phase0` from the top in a fresh Colab and paste the Environment check output to the owner |
 
 Never point these at the production spreadsheet.
 
@@ -108,4 +121,5 @@ Never point these at the production spreadsheet.
 - A run that ends with leftover `Pending`/`Failed` rows from earlier runs is reported `Partial` even though it wrote no new pending range; those rows are retried on the next run, except posts that reached `max_failed_run_attempts` (dead, D17).
 - The Grade formula depends on the named ranges `TOP_UNIV_PATTERN` / `TOP_ORG_PATTERN` over `Grade Rules`!G2:G3. If they cannot be created (no edit permission, or the names already exist elsewhere), `populate_template` writes the D1 header but leaves D2 empty and logs one warning with the fix; re-running the cell after the names exist installs the formula.
 - The D18 checkpoint means `Partial` does not by itself imply "checkpoint unchanged". A `Partial` run caused only by extraction failures still advances it, so the next Routine run does not re-scrape (and re-pay for) the window. A `Partial` run in which NO source finished (every source errored, the only source hit `max_results_ceiling_per_source`, or was deferred by the 100-post cap) leaves the checkpoint unchanged even when posts were stored; the deferred source is retried first next run, and a single-source run stuck at the ceiling needs the ceiling raised before the checkpoint can advance.
+- In a fresh Colab runtime the Environment check cell stops before anything is installed, on purpose: it names the missing packages and tells the owner to run the Smart Install cell, then Runtime > Restart session, then the notebook from the top. `ensure_environment` installs one package per pip call from the specifiers in `requirements.txt`; it never uses `-r`, `--force-reinstall`, or a `==` downgrade of a Colab-preinstalled package. Because pip may have replaced modules that are already imported, its post-install re-check is informational and the restart is still required.
 - `templates/test_grade_parity.py` is outside `tests/`, so `unittest discover tests` does not collect its live test; it is listed separately above.

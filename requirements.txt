@@ -1,9 +1,15 @@
-# Runtime dependencies. Every version is pinned; notebooks install this file with
-# `!pip install -q -r requirements.txt`.
-google-genai==1.2.0
-apify-client==1.8.1
+# Runtime dependencies. Google Colab (Python 3.13) preinstalls google-genai,
+# google-auth, pydantic and websockets, so those use lower bounds only: a `==`
+# pin there lets pip downgrade Colab's own packages. Notebooks never install this
+# file with `-r`; compmon.env_check installs only what is missing or too old.
+google-genai>=1.2
+# 1.x pins apify-shared<2.0.0, which keeps `apify_shared.utils.ignore_docs`
+# available; 1.8.1 had no upper bound, so pip pulled apify-shared 2.x and the
+# import failed.
+apify-client>=1.12,<2
+# Not preinstalled and tightly coupled to the sheet API used here.
 gspread==6.1.4
-google-auth==2.38.0
-google-auth-oauthlib==1.2.1
-pydantic==2.10.6
-python-dateutil==2.9.0.post0
+google-auth>=2.38
+google-auth-oauthlib>=1.2
+pydantic>=2.10
+python-dateutil>=2.9
