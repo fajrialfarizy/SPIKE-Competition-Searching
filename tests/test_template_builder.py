@@ -14,30 +14,100 @@ from templates.build_template import (
 from tests.fakes import FakeClient
 
 
+# A comparison of something with 0 or 1 (`>0`, `=0`, `>=1`, `<>0`, ...).
+COMPARISON_WITH_A_NUMBER = re.compile(r"[=<>!]=?\s*[01]\b")
+
+
+def _matching_close(text: str, open_index: int):
+    """Index of the `)` matching the `(` at `open_index` (None when unbalanced)."""
+    depth = 0
+    for index in range(open_index, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _matching_open(text: str, close_index: int):
+    """Index of the `(` matching the `)` at `close_index` (None when unbalanced)."""
+    depth = 0
+    for index in range(close_index, -1, -1):
+        if text[index] == ")":
+            depth += 1
+        elif text[index] == "(":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _has_top_level_arithmetic(expression: str) -> bool:
+    """True when `expression` uses +, -, *, /, ^ or & outside its own parentheses."""
+    depth = 0
+    in_string = False
+    for index, char in enumerate(expression):
+        if in_string:
+            if char == '"' and not (index + 1 < len(expression) and expression[index + 1] == '"'):
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif depth == 0 and char in "+-*/^&":
+            return True
+    return False
+
+
+def _unwrap_parens(expression: str) -> str:
+    """Strips parentheses that wrap the whole expression, e.g. `((F(x)))` -> `F(x)`."""
+    text = expression.strip()
+    while (text.startswith("(") and text.endswith(")")
+           and _matching_close(text, 0) == len(text) - 1):
+        text = text[1:-1].strip()
+    return text
+
+
 def regexmatch_compared_with_a_number(formula: str):
     """
-    Every `REGEXMATCH(...)` whose result is compared with a number right after it.
+    Every comparison of a bare `REGEXMATCH(...)` result with a number (`>0`, `=0`, ...).
 
     Fix 10: REGEXMATCH returns a BOOLEAN and Google Sheets ranks booleans ABOVE numbers, so
-    `FALSE>0` is TRUE and such a comparison is always true. Only sums of REGEXMATCH results
-    (numbers) may be compared, so anything flagged here is a bug.
+    `FALSE>0` is TRUE and such a comparison is always true. Only SUMS of REGEXMATCH results
+    are numbers and may be compared, so a sum form is accepted while a bare boolean - with or
+    without redundant parentheses around it - is reported.
     """
     found = []
-    for match in re.finditer(r"REGEXMATCH\(", formula):
-        depth = 0
-        index = match.end() - 1
-        while index < len(formula):
-            if formula[index] == "(":
-                depth += 1
-            elif formula[index] == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            index += 1
-        if index >= len(formula):
+    for match in COMPARISON_WITH_A_NUMBER.finditer(formula):
+        # The left operand of the comparison must be a parenthesised group.
+        index = match.start() - 1
+        while index >= 0 and formula[index].isspace():
+            index -= 1
+        if index < 0 or formula[index] != ")":
             continue
-        if re.match(r"\s*[=<>!]=?\s*[01]\b", formula[index + 1:index + 8]):
-            found.append(formula[match.start():index + 8])
+        open_index = _matching_open(formula, index)
+        if open_index is None:
+            continue
+        # `REGEXMATCH(...)>0`: the operand is the call itself, so the matched `(` is its
+        # ARGUMENT list and `inner` below would be just `A1,B1`. Use the call when the text
+        # before the `(` is the REGEXMATCH function name.
+        before = re.search(r"[A-Za-z_][A-Za-z0-9_.]*$", formula[:open_index])
+        if before and before.group().upper() == "REGEXMATCH":
+            found.append(formula[open_index - len(before.group()):match.end()])
+            continue
+        inner = _unwrap_parens(formula[open_index:index + 1])
+        # Only a whole REGEXMATCH call is a boolean; `LEN(...)`/`COUNTA(...)` are numbers and
+        # `REGEXMATCH(a)+REGEXMATCH(b)` is a numeric sum. Anything else is not our concern.
+        if not inner.startswith("REGEXMATCH("):
+            continue
+        if _has_top_level_arithmetic(inner):
+            continue
+        found.append(formula[open_index:match.end()])
     return found
 
 
@@ -145,6 +215,31 @@ class TestGradeFormula(unittest.TestCase):
         for name, pattern_formula in GRADE_PATTERN_HELPER_FORMULAS.items():
             self.assertTrue(pattern_formula.startswith("="), name)
             self.assertGreater(len(pattern_formula), 400, name)
+
+    def test_detector_flags_known_bad_boolean_comparisons(self):
+        """The structural guard must be proven on bad input, not only on generated formulas."""
+        bad = [
+            '=ARRAYFORMULA(IFS((REGEXMATCH(A2:A,B2)>0),"x"))',
+            '=ARRAYFORMULA(IFS((REGEXMATCH(A2:A,B2))=0,"x"))',
+            '=IF(REGEXMATCH(A1,B1)=0,"no","yes")',
+            '=IF((REGEXMATCH(A1,B1)>=1),"yes","no")',
+        ]
+        for formula in bad:
+            with self.subTest(formula=formula):
+                self.assertEqual(len(regexmatch_compared_with_a_number(formula)), 1, formula)
+
+    def test_detector_accepts_numeric_sums_and_bare_booleans(self):
+        good = [
+            # A sum of booleans is a number: comparing it with 0 is correct.
+            '=ARRAYFORMULA(IFS(((REGEXMATCH(A2:A,B2)+REGEXMATCH(C2:C,B2))>0),"x"))',
+            # A bare boolean used as a condition (the Fix 10 shape) compares with nothing.
+            '=ARRAYFORMULA(IFS((REGEXMATCH(A2:A,B2)),"x"))',
+            # Numeric functions compared with 0 stay allowed.
+            '=IF((LEN(A1)=0)*(LEN(B1)=0),"blank","filled")',
+        ]
+        for formula in good:
+            with self.subTest(formula=formula):
+                self.assertEqual(regexmatch_compared_with_a_number(formula), [], formula)
 
     def test_no_regexmatch_result_is_compared_with_a_number(self):
         """Fix 10: `REGEXMATCH(...)>0` is always TRUE in Sheets, so it must never be generated."""
