@@ -43,6 +43,13 @@ Buka sheet **Search Keywords**:
 - Keyword tidak boleh mengandung tanda koma (`,`).
 - Kolom `Frequency` = $N$ berarti keyword akan dijalankan setiap $N$ kali eksekusi Routine yang berstatus `Success`.
 
+### 3b. Cara Membangun / Memeriksa Template Spreadsheet (`00_build_sps_template`)
+Jika spreadsheet baru dibuat atau ingin memastikan ke-11 sheet dan formula terpasang dengan benar:
+1. Buka notebook `notebooks/00_build_sps_template.ipynb` di Google Colab.
+2. Jalankan sel autentikasi dan masukkan ID Spreadsheet Anda.
+3. Jalankan sel inisialisasi template: sistem akan memeriksa dan membuat sheet yang belum ada, mengatur format teks Post ID, dropdown Status Pemeriksaan, dan proteksi kolom.
+4. Sheet yang sudah memiliki data tidak akan dihapus atau ditimpa (*append-safe*).
+
 ### 4. Cara Menjalankan Initial Scraping
 1. Buka notebook `notebooks/01_initial_scraping.ipynb` di Google Colab.
 2. Pastikan Secrets (`SPREADSHEET_ID`, `APIFY_API_TOKEN`, `GEMINI_API_KEY`) sudah terisi di Colab.

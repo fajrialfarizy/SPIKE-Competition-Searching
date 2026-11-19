@@ -17,10 +17,12 @@ Dokumen ini menjelaskan langkah-langkah persiapan dan pemasangan sistem dari awa
 
 1. Buat satu file Google Spreadsheet baru di Google Drive Anda.
 2. Salin ID Spreadsheet dari URL browser Anda (bagian antara `/d/` dan `/edit`).
-3. Jalankan skrip `templates/build_template.py` untuk menginisialisasi ke-11 sheet secara otomatis:
-   ```bash
-   python -c "import gspread; from templates.build_template import populate_template; gc = gspread.oauth(); populate_template(gc, 'ID_SPREADSHEET_ANDA')"
-   ```
+3. Anda dapat menginisialisasi ke-11 sheet secara otomatis dengan salah satu dari dua cara berikut:
+   - **Opsi A (Google Colab - Direkomendasikan)**: Buka notebook `notebooks/00_build_sps_template.ipynb` di Google Colab, masukkan ID Spreadsheet Anda, dan jalankan sel-selnya.
+   - **Opsi B (Terminal Lokal)**: Jalankan skrip CLI:
+     ```bash
+     python -c "import gspread; from templates.build_template import populate_template; gc = gspread.oauth(); populate_template(gc, 'ID_SPREADSHEET_ANDA')"
+     ```
 4. Verifikasi bahwa 11 tab sheet telah terbuat dengan benar:
    - `Competition Report`
    - `System Log`

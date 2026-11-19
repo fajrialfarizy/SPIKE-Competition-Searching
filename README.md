@@ -36,6 +36,7 @@ compmon/                      # Paket Python inti
   normalization.py           # Pembersihan teks & kamus singkatan
   pipeline.py                # Orkestrator alur kerja eksekusi
 notebooks/                   # Notebook Google Colab tipis
+  00_build_sps_template.ipynb
   01_initial_scraping.ipynb
   02_routine_scraping.ipynb
   03_keyword_evaluation.ipynb
@@ -66,7 +67,7 @@ requirements.txt             # Dependensi proyek
 ## 🚀 Panduan Ringkas Penggunaan
 
 1. **Persiapan Kredensial**: Buka [docs/CREDENTIALS.md](docs/CREDENTIALS.md) untuk mengatur Secrets di Colab (`SPREADSHEET_ID`, `APIFY_API_TOKEN`, `GEMINI_API_KEY`).
-2. **Inisialisasi Template**: Jalankan `templates/build_template.py` untuk membuat 11 sheet Google Sheets.
+2. **Inisialisasi Template**: Jalankan `notebooks/00_build_sps_template.ipynb` di Google Colab (atau via skrip `templates/build_template.py`) untuk membuat 11 sheet Google Sheets.
 3. **Initial Scraping**: Buka dan jalankan `notebooks/01_initial_scraping.ipynb`.
 4. **Routine Scraping**: Jalankan `notebooks/02_routine_scraping.ipynb` setiap minggu.
 5. **Keyword Evaluation**: Jalankan `notebooks/03_keyword_evaluation.ipynb` setiap 4 minggu.
