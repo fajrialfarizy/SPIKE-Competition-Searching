@@ -148,6 +148,29 @@ class TestMatcher(unittest.TestCase):
         self.assertEqual(format_competition_id(0), "CMP-000001")
         self.assertEqual(format_competition_id(42), "CMP-000043")
 
+    def test_sheet_formatted_dates_equal_the_iso_deadline(self):
+        """Fix 9: an id_ID sheet returns 01/12/2026 where the AI returns 2026-12-01."""
+        for sheet_value in ("01/12/2026", "1/12/2026", "1 Desember 2026",
+                            "2026-12-01", "01/12/2026 00:00:00"):
+            with self.subTest(sheet_value=sheet_value):
+                self.assertEqual(are_dates_equal(sheet_value, "2026-12-01"), (True, False))
+        self.assertEqual(are_dates_equal("02/12/2026", "2026-12-01"), (False, False))
+        self.assertEqual(are_dates_equal("bukan tanggal", "2026-12-01"), (False, False))
+        self.assertEqual(are_dates_equal("bukan tanggal", "bukan tanggal"), (True, False))
+        self.assertEqual(are_dates_equal("", "2026-12-01"), (False, False))
+        self.assertEqual(are_dates_equal("", ""), (True, True))
+
+    def test_sheet_formatted_deadline_does_not_create_a_duplicate(self):
+        existing = [CompetitionRecord("CMP-000010", "Lomba Essay Nasional", "Essay",
+                                      penyelenggara="BEM FEB UI",
+                                      deadline_pendaftaran="01/12/2026")]
+        extracted = AIExtractionResult(nama_lomba="Lomba Essay Nasional",
+                                       competition_type="Essay",
+                                       penyelenggara="BEM FEB UI",
+                                       deadline_pendaftaran="2026-12-01")
+        comp_id, _both_empty, _note, _idx = match_competition_record(extracted, existing)
+        self.assertEqual(comp_id, "CMP-000010")
+
 
 class TestEligibility(unittest.TestCase):
 

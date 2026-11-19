@@ -17,10 +17,10 @@ python -m unittest templates.test_grade_parity -v
 Result of the last run:
 
 ```
-Ran 144 tests in 8.077s
+Ran 165 tests in 9.172s
 OK
 
-Ran 4 tests in 0.009s
+Ran 4 tests in 0.010s
 OK (skipped=1)
 ```
 
@@ -94,6 +94,21 @@ Recommended Config values (documented in `docs/ADMIN_GUIDE.md` §1): `account_st
 
 ---
 
+## 1f. Fix 9 — spreadsheet locale (formulas, dates, metadata)
+
+| Item | What changed | Proof (test) | Status |
+|---|---|---|---|
+| Canonical formulas + localization | `templates/formula_locale.py` holds every formula in canonical US syntax and translates only the argument separators: `localize_formula(formula, separator)` / `canonicalize_formula(formula)` rewrite commas (or `;`) **outside double-quoted strings** only, honouring the `""` escape, so `TEXTJOIN(",", …)`, `SPLIT(flat, ",")` and every literal survive. No other character changes, and the multiline D2 formula round-trips. | `test_formula_locale.TestLocalizeFormula.test_commas_inside_strings_are_preserved`, `test_nested_functions_and_no_bare_comma_in_the_semicolon_output`, `test_doubled_quotes_inside_a_string_are_an_escape`, `test_multiline_d2_formula_is_localized_and_round_trips`, `test_canonicalize_restores_the_canonical_form` | Passed (automated, mocked) |
+| Locale detection | `read_spreadsheet_properties` reads the spreadsheet `properties` from `fetch_sheet_metadata()` (gspread 6.1.4, verified: `Spreadsheet.fetch_sheet_metadata(params=None) -> Mapping`, and `Spreadsheet.locale` / `.timezone` also exist), falling back to the cached `_properties` and the `locale` / `timezone` attributes. `separator_for_locale` maps decimal-comma locales (`id`, `de`, `fr`, `es`, `it`, `pt`, `nl`, `tr`, `ru`, `pl`, …) to `;` and everything else to `,`. The locale is only read; nothing writes `update_locale`. | `test_formula_locale.TestLocalizeFormula.test_separator_table` (11 `;` locales incl. `id_ID`/`id`, 6 `,` locales incl. `""`), `TestPopulateTemplateLocale.test_indonesian_locale_writes_semicolon_formulas` | Passed (automated, mocked) |
+| Verified writes | One helper, `_write_localized_formula`, writes every formula (G2, G3, D2) with USER_ENTERED, reads the displayed value back and retries once with the other separator when the cell shows an error. If both fail it raises `FormulaLocaleError` naming the cell, the value, the locale and the separators, and `D2` is not installed while the helper cells error. | `TestPopulateTemplateLocale.test_error_for_both_separators_raises_and_does_not_install_d2` (message contains `Grade Rules!G2`, `#ERROR!`, `id_ID`, both separators; D2 stays empty), `test_wrong_first_guess_is_retried_with_the_other_separator` (en_US locale, comma formula rejected → two writes, `;` version kept), `test_indonesian_locale_writes_semicolon_formulas` | Passed (automated, mocked) |
+| Idempotency (FORMULA render option) | D2 and G2:G3 are read with `value_render_option="FORMULA"` (gspread 6.1.4 signature verified) and classified from the formula text after `canonicalize_formula`: empty → install, generated → rewrite only when it differs (wrong separator), custom → never overwritten. A computed `""` can no longer look like an empty cell. | `TestPopulateTemplateIdempotency.test_rerun_does_not_rewrite_an_identical_generated_d2`, `test_rerun_does_not_rewrite_identical_helper_cells`, `test_custom_d2_is_not_overwritten_even_when_it_evaluates_to_empty` (fake evaluates every formula to `""`), `test_custom_helper_cell_is_not_overwritten`, `test_existing_comma_formula_is_repaired_for_the_new_locale` | Passed (automated, mocked) |
+| Time zone | `warn_if_timezone_is_not_jakarta` prints and logs an Indonesian warning when `properties.timeZone != "Asia/Jakarta"`; the time zone is never written. | `TestPopulateTemplateLocale.test_time_zone_is_only_reported_never_changed` (message contains `PERINGATAN` + `Asia/Jakarta`, `time_zone` unchanged), `test_jakarta_time_zone_prints_no_warning` | Passed (automated, mocked) |
+| Admin-entered dates | `compmon.matcher.are_dates_equal` parses both sides with `parse_sheet_date` (ISO first, then day-first `dd/mm/yyyy` / `d/m/yyyy` / `1 Desember 2026` through dateutil `dayfirst=True` with an Indonesian month map) and compares `date` objects; unparseable values never raise and only match identical text. | `test_compmon.TestMatcher.test_sheet_formatted_dates_equal_the_iso_deadline` (`01/12/2026`, `1/12/2026`, `1 Desember 2026`, `2026-12-01 00:00:00` all equal `2026-12-01`; `02/12/2026` and `bukan tanggal` unequal), `test_sheet_formatted_deadline_does_not_create_a_duplicate` | Passed (automated, mocked) |
+| Colab visibility | `notebooks/00_build_sps_template.ipynb` sets `basicConfig(level=INFO, force=True)` and INFO for the `compmon` / `templates` loggers before `populate_template`, and the locale/separator plus any warning are printed. | Notebook cell 2 (manual review; not executed here) | Not tested (needs real services) |
+| Real spreadsheet | G2:G3 and D2 on an actual `id_ID` spreadsheet | Run notebook 00 against the real sheet and confirm G2:G3 and D2 show no `#ERROR!` | Not tested (needs real services) |
+
+---
+
 ## 2. PRD / regression coverage
 
 | Area | Module under test | Proof | Status |
@@ -121,6 +136,7 @@ Recommended Config values (documented in `docs/ADMIN_GUIDE.md` §1): `account_st
 | Grade formula parity on a real spreadsheet | Needs a real TEST spreadsheet (ARRAYFORMULA evaluation) | `COMPMON_TEST_SPREADSHEET_ID=<test sheet id> python -m unittest templates.test_grade_parity -v` |
 | Apify account-pagination cost (resultsLimit 20 vs large, `usageTotalUsd`) | Needs a paid Apify token and burns credits | `notebooks/test_apify_actors_phase0.ipynb` section 4 (set `RUN_COST_EXPERIMENT = True`) |
 | Google Sheets quota/backoff against the real API | Needs a real spreadsheet and enough traffic to hit 60 rpm | Run notebook 01/02 against a TEST spreadsheet |
+| Formula localization on a real `id_ID` spreadsheet (G2:G3 and D2 after notebook 00) | Needs a real spreadsheet whose locale is Indonesian; the fakes simulate `#ERROR!` but cannot prove Google's parser | Run notebook 00 on the real sheet and clear `Grade Rules`!G2:G3 first if they are already broken |
 | Fresh Colab install of `requirements.txt` and the Environment check / Smart install cells | Needs a fresh Google Colab runtime (Python 3.13); not run here, so the `apify_shared` import failure is only proven fixed by the resolver metadata plus an isolated 1.12.2 + apify-shared 1.5.0 install | Run notebooks 01–03 and `test_apify_actors_phase0` from the top in a fresh Colab and paste the Environment check output to the owner |
 
 Never point these at the production spreadsheet.
@@ -136,4 +152,6 @@ Never point these at the production spreadsheet.
 - The Grade formula depends on the named ranges `TOP_UNIV_PATTERN` / `TOP_ORG_PATTERN` over `Grade Rules`!G2:G3. If they cannot be created (no edit permission, or the names already exist elsewhere), `populate_template` writes the D1 header but leaves D2 empty and logs one warning with the fix; re-running the cell after the names exist installs the formula.
 - The D18 checkpoint means `Partial` does not by itself imply "checkpoint unchanged". A `Partial` run caused only by extraction failures still advances it, so the next Routine run does not re-scrape (and re-pay for) the window. A `Partial` run in which NO source finished (every source errored, the only source hit `max_results_ceiling_per_source`, or was deferred by the 100-post cap) leaves the checkpoint unchanged even when posts were stored; the deferred source is retried first next run. Fix 8 then parks a source whose entry recorded `ceiling=<value>`: later runs skip it (no actor run, no credits) and the checkpoint is no longer held back by it, so the owner has to raise `max_results_ceiling_per_source` above that value for the source to be scraped again.
 - In a fresh Colab runtime the Environment check cell stops before anything is installed, on purpose: it names the missing packages and tells the owner to run the Smart Install cell, then Runtime > Restart session, then the notebook from the top. `ensure_environment` installs one package per pip call from the specifiers in `requirements.txt`; it never uses `-r`, `--force-reinstall`, or a `==` downgrade of a Colab-preinstalled package. Because pip may have replaced modules that are already imported, its post-install re-check is informational and the restart is still required.
+- Formula localization (Fix 9) is driven by the spreadsheet locale read at run time: the same deployment writes `,` on an `en_US` sheet and `;` on `id_ID`. An already-installed sheet with comma formulas on an `id_ID` locale is repaired by re-running notebook 00 (the stored formula is recognized as generated and rewritten with the right separator); a *custom* formula in G2:G3 or D2 is never touched, so a manual formula that errors must be cleared by hand. `populate_template` now raises instead of warning when a formula still errors after both separators, which stops the template cell before D2 is installed.
+- Locale-sensitive values were reviewed beyond the matcher: `Frequency` is an integer (`int()` on the displayed text, unaffected by the decimal comma because the sheet stores whole numbers), `Run State` values are written by the system in ISO form (never re-typed by the locale), `Competition Report` IDs are text (`CMP-000123`), and the only locale-formatted values the pipeline reads are the admin date columns, now normalized in `are_dates_equal`.
 - `templates/test_grade_parity.py` is outside `tests/`, so `unittest discover tests` does not collect its live test; it is listed separately above.

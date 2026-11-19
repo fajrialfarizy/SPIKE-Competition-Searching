@@ -10,10 +10,21 @@ Rules:
 - Sheets are created with enough rows for explicit-range writes (Task 27).
 - Protected ranges are idempotent, cover the whole sheet and are warning-only so that any
   admin running the notebook can still write a Competition ID in column A (Task 27).
+- Fix 9: formulas stay canonical (comma) here and are localized only when written, using
+  the spreadsheet's own locale (`;` for decimal-comma locales such as `id_ID`). The locale
+  and the time zone are read, never changed; a non-Jakarta time zone only prints a warning.
+- Fix 9: D2 / G2:G3 are read with the FORMULA render option, so a computed `""` can never
+  look like an empty cell: a generated formula is refreshed only when it really differs and
+  an admin's custom formula is never overwritten.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from templates.formula_locale import (
+    FORMULA_ERROR_HINT, FormulaLocaleError, canonicalize_formula, is_formula_error,
+    localize_formula, other_separator, separator_for_locale,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +378,129 @@ GRADE_ARRAYFORMULA_D2 = build_grade_arrayformula(INITIAL_SHEETS_DATA["Grade Rule
 
 
 # ---------------------------------------------------------------------------
+# Fix 9: locale-aware formula writes
+# ---------------------------------------------------------------------------
+
+def read_spreadsheet_properties(sh: Any) -> Dict[str, Any]:
+    """
+    Reads the spreadsheet `properties` (at least `locale` and `timeZone`).
+
+    `Spreadsheet.fetch_sheet_metadata()` (gspread 6.1.4) returns the full spreadsheet
+    resource, whose `properties` hold the locale. The cached `_properties` from
+    `open_by_key` and the `locale` / `timezone` attributes are fallbacks, so a fake or an
+    older gspread never blocks template creation. Nothing here writes the properties.
+    """
+    try:
+        metadata = sh.fetch_sheet_metadata()
+        properties = metadata.get("properties") if isinstance(metadata, dict) else None
+        if isinstance(properties, dict) and properties:
+            return properties
+    except Exception as e:  # never block on a metadata read
+        logger.warning(f"Could not read the spreadsheet metadata ({e}); using cached properties")
+
+    cached = getattr(sh, "_properties", None)
+    if isinstance(cached, dict) and cached:
+        return cached
+
+    properties: Dict[str, Any] = {}
+    for key, attr in (("locale", "locale"), ("timeZone", "timezone")):
+        try:
+            value = getattr(sh, attr)
+        except Exception:
+            value = None
+        if value:
+            properties[key] = value
+    return properties
+
+
+def warn_if_timezone_is_not_jakarta(properties: Dict[str, Any]) -> str:
+    """
+    Reports a time zone other than Asia/Jakarta in Indonesian. Never changes it.
+
+    The message is printed (visible in Colab even without logging configured) and logged,
+    because every date the pipeline writes is computed in `Config.timezone`.
+    """
+    time_zone = str(properties.get("timeZone") or "").strip()
+    if time_zone and time_zone != "Asia/Jakarta":
+        message = (
+            f"PERINGATAN: zona waktu spreadsheet ini adalah '{time_zone}', bukan 'Asia/Jakarta'. "
+            "Sistem TIDAK mengubah zona waktu spreadsheet; tanggal/jam yang ditulis notebook "
+            "memakai zona waktu dari sheet Config (Asia/Jakarta). Ubah Time zone secara manual "
+            "di File > Settings bila ingin keduanya sama."
+        )
+        logger.warning(message)
+        print(message)
+    return time_zone
+
+
+def _read_formula(ws: Any, cell: str) -> str:
+    """Formula text of `cell` (FORMULA render option); text cells come back unchanged."""
+    try:
+        value = ws.acell(cell, value_render_option="FORMULA")
+    except TypeError:  # pragma: no cover - only for a double without the keyword
+        value = ws.acell(cell)
+    text = getattr(value, "value", value)
+    if isinstance(text, list):  # defensive: a ValueRange instead of a single cell
+        text = text[0][0] if text and text[0] else ""
+    return str(text or "")
+
+
+def _read_display(ws: Any, cell: str) -> str:
+    """Value the sheet currently shows in `cell` (FORMATTED_VALUE, which exposes errors)."""
+    try:
+        value = ws.acell(cell)
+    except TypeError:  # pragma: no cover
+        value = ws.acell(cell, value_render_option="FORMATTED_VALUE")
+    text = getattr(value, "value", value)
+    if isinstance(text, list):
+        text = text[0][0] if text and text[0] else ""
+    return str(text or "")
+
+
+def _formula_values(ws: Any) -> List[List[str]]:
+    """Whole worksheet read with the FORMULA render option (computed values are useless)."""
+    return ws.get_all_values(value_render_option="FORMULA")
+
+
+def _write_localized_formula(
+    ws: Any, cell: str, canonical_formula: str, separator: str, locale: str, what: str
+) -> Tuple[str, str]:
+    """
+    Writes ONE formula for the spreadsheet locale and verifies it.
+
+    The formula is localized with `separator`, written with USER_ENTERED and read back. If
+    the cell shows an error value (#ERROR!, #NAME?, …) the other separator is tried once.
+    If the cell still shows an error, `FormulaLocaleError` is raised naming the cell, the
+    value, the locale and the separators tried - never a warning that leaves a broken sheet.
+
+    Returns (written_formula, separator_that_worked).
+    """
+    tried: List[str] = []
+    last_value = ""
+    for candidate in (separator, other_separator(separator)):
+        formula = localize_formula(canonical_formula, candidate)
+        ws.update(range_name=cell, values=[[formula]], value_input_option="USER_ENTERED")
+        last_value = _read_display(ws, cell).strip()
+        tried.append(candidate)
+        if not is_formula_error(last_value):
+            logger.info(f"Wrote {ws.title}!{cell} with separator {candidate!r} (locale {locale!r})")
+            return formula, candidate
+        logger.warning(
+            f"{ws.title}!{cell} shows {last_value!r} with separator {candidate!r}; "
+            f"retrying with {other_separator(candidate)!r}"
+        )
+
+    separators = ", ".join(repr(s) for s in tried)
+    raise FormulaLocaleError(
+        f"Gagal menulis formula ke {ws.title}!{cell} ({what}): sel menampilkan "
+        f"'{last_value}' untuk separator {separators} (locale spreadsheet: "
+        f"'{locale or 'tidak diketahui'}'). {FORMULA_ERROR_HINT}. Formula sumber tetap "
+        f"memakai sintaks kanonik (koma). Periksa locale spreadsheet dan named range, "
+        f"lalu jalankan ulang sel ini."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Sheet initialisation (Task 27)
 # ---------------------------------------------------------------------------
 
@@ -460,6 +594,17 @@ def populate_template(spreadsheet_client: Any, spreadsheet_id: str):
       full-sheet protected ranges.
     """
     sh = spreadsheet_client.open_by_key(spreadsheet_id)
+
+    # Fix 9: read the locale (never change it) and pick the separator formulas need there.
+    properties = read_spreadsheet_properties(sh)
+    locale = str(properties.get("locale") or "").strip()
+    separator = separator_for_locale(locale)
+    warn_if_timezone_is_not_jakarta(properties)
+    print(
+        f"Locale spreadsheet: '{locale or 'tidak diketahui'}' -> pemisah argumen "
+        f"formula '{separator}'. Formula di kode tetap memakai sintaks kanonik (koma)."
+    )
+
     existing_ws = {ws.title: ws for ws in sh.worksheets()}
 
     for sheet_name, content in INITIAL_SHEETS_DATA.items():
@@ -481,14 +626,15 @@ def populate_template(spreadsheet_client: Any, spreadsheet_id: str):
     grade_ws = existing_ws.get("Grade Rules")
     missing_patterns: Set[str] = set(ENTITY_PATTERN_NAMED_RANGES)
     if grade_ws:
-        missing_patterns = _install_grade_pattern_helpers(sh, grade_ws)
+        missing_patterns = _install_grade_pattern_helpers(sh, grade_ws, separator, locale)
 
     comp_ws = existing_ws.get("Competition Report")
     if comp_ws:
         if missing_patterns:
             # Writing D2 without its named ranges would show #NAME? in every Grade cell, which
             # looks like a grading bug. Keep the header, leave D2 alone, warn once.
-            _install_grade_formula(comp_ws, patterns_ready=False)
+            _install_grade_formula(comp_ws, patterns_ready=False, separator=separator,
+                                   locale=locale)
             logger.warning(
                 "Competition Report!D2 was left untouched because the named range(s) %s are "
                 "missing: the Grade formula would show #NAME? in every row. Cause: "
@@ -500,7 +646,7 @@ def populate_template(spreadsheet_client: Any, spreadsheet_id: str):
                 ", ".join(sorted(missing_patterns)),
             )
         else:
-            _install_grade_formula(comp_ws)
+            _install_grade_formula(comp_ws, separator=separator, locale=locale)
         _install_status_validation(sh, comp_ws)
         _ensure_protected_ranges(sh, comp_ws)
 
@@ -511,17 +657,23 @@ def populate_template(spreadsheet_client: Any, spreadsheet_id: str):
     print(f"Template populated safely without overwrite for Spreadsheet: {spreadsheet_id}")
 
 
-def _install_grade_formula(comp_ws, patterns_ready: bool = True):
+def _install_grade_formula(comp_ws, patterns_ready: bool = True,
+                           separator: str = ",", locale: str = ""):
     """
     Writes D1 header / D2 ARRAYFORMULA only where it is safe to do so.
 
     `patterns_ready=False` means the named ranges the formula references are not confirmed to
     exist: D1 is still written, but D2 is left completely untouched so the column cannot fill
     with #NAME?.
+
+    Fix 9: D2 is read with the FORMULA render option, so the decision is made from the formula
+    text (normalized for the locale separator), never from a computed `""`. An identical
+    generated formula is not rewritten, a generated formula with the wrong separator is
+    refreshed, and an admin's custom formula is never overwritten.
     """
-    values = comp_ws.get_all_values()
-    d1 = values[0][3].strip() if values and len(values[0]) > 3 else ""
-    d2 = values[1][3].strip() if len(values) > 1 and len(values[1]) > 3 else ""
+    values = _formula_values(comp_ws)
+    d1 = _cell_at(values, 1, COL_GRADE)
+    d2 = _cell_at(values, 2, COL_GRADE)
 
     if not d1:
         comp_ws.update(range_name="D1", values=[["Grade Lomba"]], value_input_option="RAW")
@@ -530,14 +682,38 @@ def _install_grade_formula(comp_ws, patterns_ready: bool = True):
     if not patterns_ready:
         return
 
+    canonical = GRADE_ARRAYFORMULA_D2
     if not d2:
-        comp_ws.update(range_name="D2", values=[[GRADE_ARRAYFORMULA_D2]], value_input_option="USER_ENTERED")
+        _write_localized_formula(comp_ws, "D2", canonical, separator, locale,
+                                 what="Grade ARRAYFORMULA")
         logger.info("Installed Grade ARRAYFORMULA in D2")
-    elif d2.startswith("=ARRAYFORMULA(IFS("):
-        comp_ws.update(range_name="D2", values=[[GRADE_ARRAYFORMULA_D2]], value_input_option="USER_ENTERED")
-        logger.info("Refreshed generated Grade ARRAYFORMULA in D2")
-    else:
+        return
+
+    if canonicalize_formula(d2).strip() != canonicalize_formula(canonical).strip():
         logger.warning("D2 already contains a non-generated value; left untouched")
+        return
+
+    if d2.strip() == localize_formula(canonical, separator).strip():
+        logger.info("D2 already holds the generated formula for this locale; left untouched")
+        return
+
+    _write_localized_formula(comp_ws, "D2", canonical, separator, locale,
+                             what="Grade ARRAYFORMULA")
+    logger.info("Refreshed generated Grade ARRAYFORMULA in D2")
+
+
+def _assert_helper_cells_render(grade_ws, locale: str) -> None:
+    """Raises when a helper cell the Grade formula depends on is showing an error."""
+    for spec in ENTITY_PATTERN_NAMED_RANGES.values():
+        cell = f"{GRADE_HELPER_VALUE_COL}{spec['row']}"
+        shown = _read_display(grade_ws, cell).strip()
+        if is_formula_error(shown):
+            raise FormulaLocaleError(
+                f"Formula D2 tidak dipasang karena sel bantu {grade_ws.title}!{cell} "
+                f"menampilkan '{shown}' (locale spreadsheet: '{locale or 'tidak diketahui'}'). "
+                f"{FORMULA_ERROR_HINT}. Kosongkan sel bantu tersebut (G2:G3) lalu jalankan "
+                f"ulang sel ini."
+            )
 
 
 def _cell_at(values: List[List[str]], row: int, letter: str) -> str:
@@ -551,7 +727,8 @@ def _cell_at(values: List[List[str]], row: int, letter: str) -> str:
     return (line[index] or "").strip()
 
 
-def _install_grade_pattern_helpers(sh, grade_ws) -> Set[str]:
+def _install_grade_pattern_helpers(sh, grade_ws, separator: str = ",",
+                                   locale: str = "") -> Set[str]:
     """
     Puts each compiled alias pattern in ONE cell of `Grade Rules` (columns F-G) and exposes
     it as a named range, so `Competition Report!D2` stays small.
@@ -559,12 +736,13 @@ def _install_grade_pattern_helpers(sh, grade_ws) -> Set[str]:
     Returns the names that could NOT be confirmed to exist (empty set = all good). The caller
     must not install D2 when this set is non-empty.
 
-    Safe to re-run: a label or pattern cell is written only when it is EMPTY (an admin value
-    is never overwritten), and a named range is created only when that name is not
-    registered yet. To regenerate a pattern after a generator change, clear `F2:G3` and run
-    the notebook cell again.
+    Fix 9: the cells are read with the FORMULA render option and written through
+    `_write_localized_formula`, so the pattern matches the spreadsheet locale (`;` on an
+    Indonesian sheet) and a wrong separator is repaired instead of silently showing #ERROR!.
+    A label or pattern cell is never overwritten with foreign content, and a named range is
+    created only when that name is not registered yet.
     """
-    values = grade_ws.get_all_values()
+    values = _formula_values(grade_ws)
 
     if not _cell_at(values, 1, GRADE_HELPER_LABEL_COL):
         grade_ws.update(
@@ -578,24 +756,35 @@ def _install_grade_pattern_helpers(sh, grade_ws) -> Set[str]:
         row = spec["row"]
         label_cell = f"{GRADE_HELPER_LABEL_COL}{row}"
         value_cell = f"{GRADE_HELPER_VALUE_COL}{row}"
+        canonical = GRADE_PATTERN_HELPER_FORMULAS[name]
 
         if not _cell_at(values, row, GRADE_HELPER_LABEL_COL):
             grade_ws.update(range_name=label_cell, values=[[name]], value_input_option="RAW")
 
-        current = _cell_at(values, row, GRADE_HELPER_VALUE_COL)
+        current = _cell_at(values, row, GRADE_HELPER_VALUE_COL).strip()
         if not current:
-            grade_ws.update(
-                range_name=value_cell,
-                values=[[GRADE_PATTERN_HELPER_FORMULAS[name]]],
-                value_input_option="USER_ENTERED",
-            )
+            _write_localized_formula(grade_ws, value_cell, canonical, separator, locale,
+                                     what=f"pola alias {name}")
             logger.info(f"Wrote alias pattern {name} to Grade Rules!{value_cell}")
+        elif canonicalize_formula(current).strip() == canonicalize_formula(canonical).strip():
+            if current == localize_formula(canonical, separator).strip():
+                logger.info(
+                    f"Grade Rules!{value_cell} already holds the generated pattern; left untouched"
+                )
+            else:
+                logger.info(
+                    f"Rewriting Grade Rules!{value_cell} with separator {separator!r} "
+                    f"for locale {locale!r}"
+                )
+                _write_localized_formula(grade_ws, value_cell, canonical, separator, locale,
+                                         what=f"pola alias {name}")
         else:
             logger.warning(
                 f"Grade Rules!{value_cell} already holds a value; left untouched "
                 "(clear the cell to regenerate the pattern)"
             )
 
+    _assert_helper_cells_render(grade_ws, locale)
     return _ensure_grade_named_ranges(sh, grade_ws)
 
 

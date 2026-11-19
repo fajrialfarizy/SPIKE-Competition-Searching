@@ -4,9 +4,64 @@ Normalizes competition attributes and matches posts against Competition Report r
 Handles admin rows with missing Competition IDs safely (Instruction 17).
 """
 
+import re
+from datetime import date
 from typing import List, Dict, Tuple, Optional
+
+import dateutil.parser
+
 from compmon.models import CompetitionRecord, AIExtractionResult
 from compmon.normalization import normalize_for_matching, normalize_competition_type
+
+# Fix 9: a spreadsheet with an Indonesian locale returns dates as formatted text
+# ("01/12/2026"), so comparing raw strings would create duplicate competitions.
+INDONESIAN_MONTHS = {
+    "januari": "january", "februari": "february", "pebruari": "february",
+    "maret": "march", "april": "april", "mei": "may", "juni": "june",
+    "juli": "july", "agustus": "august", "september": "september",
+    "oktober": "october", "november": "november", "desember": "december",
+    "jan": "jan", "peb": "feb", "feb": "feb", "agu": "aug", "agt": "aug",
+    "okt": "oct", "nop": "nov", "des": "dec",
+}
+
+_MONTH_RE = re.compile(
+    r"\b(" + "|".join(sorted(INDONESIAN_MONTHS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _translate_indonesian_months(text: str) -> str:
+    """Replaces Indonesian month names with the English ones dateutil understands."""
+    return _MONTH_RE.sub(lambda m: INDONESIAN_MONTHS[m.group(0).lower()], text)
+
+
+def parse_sheet_date(value: Optional[str]) -> Optional[date]:
+    """
+    Parses a date as it arrives from Google Sheets, or None when it is not a date.
+
+    Order: ISO (`2026-12-01`, also with a time part) first, then day-first formats
+    (`01/12/2026`, `1/12/2026`, `1 Desember 2026`) through python-dateutil `dayfirst=True`.
+    A value without any date separator / month name is treated as unparseable (None), so a
+    loose `2026` cannot be read as somebody's deadline.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    try:
+        return date.fromisoformat(text.split("T")[0].split(" ")[0].strip())
+    except ValueError:
+        pass
+
+    if not re.search(r"\d", text):
+        return None
+    if not (("/" in text) or ("-" in text) or (" " in text) or _MONTH_RE.search(text)):
+        return None
+
+    try:
+        return dateutil.parser.parse(_translate_indonesian_months(text), dayfirst=True).date()
+    except (ValueError, OverflowError):
+        return None
 
 
 def are_attributes_equal(val1: Optional[str], val2: Optional[str]) -> Tuple[bool, bool]:
@@ -33,14 +88,25 @@ def are_types_equal(type1: Optional[str], type2: Optional[str]) -> Tuple[bool, b
 
 
 def are_dates_equal(date1: Optional[str], date2: Optional[str]) -> Tuple[bool, bool]:
-    """Compares dates formatted as YYYY-MM-DD."""
+    """
+    Compares two dates after normalizing the format.
+
+    The AI returns `YYYY-MM-DD`, while an Indonesian-locale sheet hands back `01/12/2026` (or
+    `1 Desember 2026`), so both sides are parsed first (Fix 9). Identical text never stops
+    matching, and a value that cannot be parsed is simply unequal - never an exception.
+    """
     d1 = (date1 or "").strip()
     d2 = (date2 or "").strip()
     if not d1 and not d2:
         return True, True
-    if d1 == d2:
-        return True, False
-    return False, False
+    if not d1 or not d2:
+        return False, False
+
+    parsed1 = parse_sheet_date(d1)
+    parsed2 = parse_sheet_date(d2)
+    if parsed1 is not None and parsed2 is not None:
+        return parsed1 == parsed2, False
+    return d1 == d2, False
 
 
 def match_competition_record(

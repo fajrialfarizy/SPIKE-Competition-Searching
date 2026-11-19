@@ -31,6 +31,14 @@ Sheet **Config** menyimpan parameter operasional sistem. Admin dapat mengubah ni
 >
 > Dengan nilai ini Initial Scraping memakai paling banyak 2 run per akun (200 lalu 300) dan Routine tetap murah (40, lalu 300 hanya bila 40 pertama sudah penuh). Eksperimen biaya dapat diulang di sel opt-in `notebooks/test_apify_actors_phase0.ipynb` (bagian 4).
 
+### 1b. Formula, Locale Spreadsheet, dan Format Tanggal
+- Formula `Competition Report!D2` (Grade Lomba) dan sel bantu pola alias `Grade Rules!G2:G3` ditulis oleh notebook **00** mengikuti **locale spreadsheet**: pada locale Indonesia (`id_ID`) pemisah argumennya `;`, pada locale AS/Inggris `,`. Kode tetap memakai sintaks kanonik (koma); penerjemahan hanya terjadi saat menulis. **Locale spreadsheet cukup dibaca, tidak diubah dan tidak perlu diubah.**
+- Setiap formula dibaca kembali setelah ditulis. Bila sel menampilkan `#ERROR!`, `#NAME?`, `#N/A`, atau `#REF!`, sel dicoba sekali lagi dengan pemisah lainnya. Bila tetap gagal, notebook **berhenti dengan pesan error** yang menyebut nama sel, nilai error, locale, dan pemisah yang dicoba (bukan peringatan yang dibiarkan berlalu), dan `D2` **tidak** dipasang selama sel bantu masih error.
+- **Regenerasi sel bantu:** kosongkan `Grade Rules`!`G2:G3` (kosongkan juga `F2:F3` bila labelnya ikut rusak), lalu jalankan ulang sel **2. Jalankan Inisialisasi Template** di `notebooks/00_build_sps_template.ipynb`. Named range `TOP_UNIV_PATTERN` / `TOP_ORG_PATTERN` tidak perlu dibuat ulang; pola akan ditulis dengan pemisah yang benar untuk locale tersebut.
+- Formula `D2` buatan admin **tidak pernah ditimpa**. Formula hasil sistem hanya ditulis ulang bila isinya benar-benar berbeda (termasuk bila pemisahnya masih salah), jadi menjalankan ulang sel 00 aman (idempoten). Mengubah tabel `Grade Rules` (nilai Grade/Skala/Mode/Priority) tetap membutuhkan menjalankan ulang sel tersebut karena urutan cabang dihasilkan dari Priority.
+- **Tanggal yang diketik admin** di `Competition Report` (kolom `Tanggal Mulai Registrasi` / `Deadline Pendaftaran`): gunakan `YYYY-MM-DD` (paling aman) atau `dd/mm/yyyy` (mis. `01/12/2026` berarti 1 Desember 2026). Sistem menormalkan kedua format sebelum membandingkan dengan hasil AI, sehingga baris duplikat tidak dibuat; format yang tidak bisa dibaca dianggap berbeda dan tidak pernah menggagalkan run.
+- **Zona waktu spreadsheet hanya diperiksa.** Bila bukan `Asia/Jakarta`, sel 00 menampilkan peringatan dalam bahasa Indonesia tetapi **tidak mengubahnya**; tanggal/jam yang ditulis sistem tetap memakai zona waktu dari sheet `Config`.
+
 ### 2. Cara Mengisi & Mengelola `Source Accounts`
 Buka sheet **Source Accounts**:
 - Masukkan username Instagram pada kolom A (tanpa tanda `@`).

@@ -37,6 +37,13 @@ class GridLimitError(ValueError):
     pass
 
 
+class FakeCell:
+    """Minimal stand-in for `gspread.cell.Cell` (only `.value` is used)."""
+
+    def __init__(self, value: Any):
+        self.value = value
+
+
 class FakeWorksheet:
     def __init__(self, title: str, data: Optional[List[List[str]]] = None,
                  rows: int = SHEET_ROWS, cols: int = SHEET_COLS, sheet_id: int = 1,
@@ -59,6 +66,11 @@ class FakeWorksheet:
         # Ranges whose write must fail (used to prove that a Sheets write error does not
         # consume an extraction attempt).
         self.fail_ranges = set()
+        # Fix 9: computed/displayed value per A1 cell, filled only when the workbook has a
+        # `formula_engine`. Without it, reads return the stored text (pre-Fix 9 behaviour).
+        self.display: Dict[str, str] = {}
+        # Every `value_render_option` this worksheet was read with (FORMULA assertions).
+        self.value_render_options: List[Optional[str]] = []
 
     def _count_api_call(self):
         self.api_calls += 1
@@ -83,10 +95,40 @@ class FakeWorksheet:
         self._cols += cols
 
     # -- reads --------------------------------------------------------------
-    def get_all_values(self) -> List[List[str]]:
+    def get_all_values(self, range_name: Optional[str] = None,
+                       value_render_option: Optional[str] = None, **kwargs) -> List[List[str]]:
+        # gspread 6.1.4 signature includes value_render_option; "FORMULA" returns formula text.
         self._count_api_call()
         self._maybe_fail()
-        return [list(r) for r in self.data]
+        self.value_render_options.append(value_render_option)
+        if value_render_option == "FORMULA" or not self.display:
+            return [list(r) for r in self.data]
+        rows: List[List[str]] = []
+        for row_idx, row in enumerate(self.data, start=1):
+            rows.append([
+                self.display.get(f"{index_to_col(col_idx)}{row_idx}", cell)
+                for col_idx, cell in enumerate(row)
+            ])
+        return rows
+
+    def _raw_cell(self, ref: str) -> str:
+        match = A1_RE.match(ref)
+        if not match:
+            raise ValueError(f"Unsupported cell: {ref}")
+        row, col = int(match.group(2)), col_to_index(match.group(1))
+        if row - 1 >= len(self.data) or col >= len(self.data[row - 1]):
+            return ""
+        return str(self.data[row - 1][col])
+
+    def acell(self, label: str, value_render_option: Optional[str] = "FORMATTED_VALUE"):
+        """gspread 6.1.4 `acell(label, value_render_option=...)` -> object with `.value`."""
+        self._count_api_call()
+        self._maybe_fail()
+        self.value_render_options.append(value_render_option)
+        ref = str(label).upper()
+        if value_render_option == "FORMULA":
+            return FakeCell(self._raw_cell(ref))
+        return FakeCell(self.display.get(ref, self._raw_cell(ref)))
 
     def col_values(self, col: int) -> List[str]:
         self._count_api_call()
@@ -144,10 +186,18 @@ class FakeWorksheet:
             raise ValueError(f"Unsupported range: {range_name}")
         start_col = col_to_index(match.group(1))
         start_row = int(match.group(2))
+        engine = getattr(self.workbook, "formula_engine", None) if self.workbook else None
         for r_off, row_values in enumerate(values):
             for c_off, cell in enumerate(row_values):
                 self._ensure_cell(start_row + r_off, start_col + c_off)
                 self.data[start_row + r_off - 1][start_col + c_off] = str(cell)
+                ref = f"{index_to_col(start_col + c_off)}{start_row + r_off}"
+                if isinstance(cell, str) and cell.startswith("="):
+                    if engine is not None:
+                        # What the sheet would SHOW for this formula ("" or an error).
+                        self.display[ref] = engine(cell)
+                else:
+                    self.display.pop(ref, None)
         return {}
 
     def batch_update(self, data, value_input_option: Optional[str] = None, **kwargs):
@@ -206,6 +256,11 @@ class FakeSpreadsheet:
         self._next_protected_id = 1000
         # Total API calls (reads + writes + worksheet lookups) for budget assertions.
         self.api_calls = 0
+        # Fix 9: spreadsheet-level metadata (read-only for the template builder).
+        self.locale = "en_US"
+        self.time_zone = "Asia/Jakarta"
+        # Optional callable(formula) -> shown value, used by the locale tests.
+        self.formula_engine = None
 
         if empty:
             return
@@ -228,6 +283,11 @@ class FakeSpreadsheet:
                     name, rows, rows=row_count, sheet_id=len(self._worksheets) + 1,
                     workbook=self,
                 )
+
+    def fetch_sheet_metadata(self, params=None):
+        """gspread 6.1.4 Spreadsheet.fetch_sheet_metadata(); properties carry the locale."""
+        self.api_calls += 1
+        return {"properties": {"locale": self.locale, "timeZone": self.time_zone}}
 
     def worksheets(self):
         return list(self._worksheets.values())
