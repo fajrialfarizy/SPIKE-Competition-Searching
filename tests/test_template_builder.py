@@ -14,6 +14,60 @@ from templates.build_template import (
 from tests.fakes import FakeClient
 
 
+def regexmatch_compared_with_a_number(formula: str):
+    """
+    Every `REGEXMATCH(...)` whose result is compared with a number right after it.
+
+    Fix 10: REGEXMATCH returns a BOOLEAN and Google Sheets ranks booleans ABOVE numbers, so
+    `FALSE>0` is TRUE and such a comparison is always true. Only sums of REGEXMATCH results
+    (numbers) may be compared, so anything flagged here is a bug.
+    """
+    found = []
+    for match in re.finditer(r"REGEXMATCH\(", formula):
+        depth = 0
+        index = match.end() - 1
+        while index < len(formula):
+            if formula[index] == "(":
+                depth += 1
+            elif formula[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            index += 1
+        if index >= len(formula):
+            continue
+        if re.match(r"\s*[=<>!]=?\s*[01]\b", formula[index + 1:index + 8]):
+            found.append(formula[match.start():index + 8])
+    return found
+
+
+def ifs_conditions(formula: str):
+    """The condition of every IFS branch (text before the first top-level comma)."""
+    body = formula[formula.index("IFS(") + len("IFS("):]
+    conditions = []
+    for line in body.splitlines():
+        text = line.strip()
+        if not text or text.startswith(")"):
+            continue
+        depth = 0
+        in_string = False
+        for index, char in enumerate(text):
+            if in_string:
+                if char == '"' and not (index + 1 < len(text) and text[index + 1] == '"'):
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char == "," and depth == 0:
+                conditions.append(text[:index].strip())
+                break
+    return conditions
+
+
 class TestTemplateData(unittest.TestCase):
 
     def test_all_11_sheets_present(self):
@@ -61,14 +115,16 @@ class TestGradeFormula(unittest.TestCase):
     def test_formula_shape(self):
         formula = GRADE_ARRAYFORMULA_D2
         self.assertTrue(formula.startswith("=ARRAYFORMULA(IFS("))
-        # The alias patterns are named ranges, not inlined expressions.
-        self.assertIn("TOP_UNIV_PATTERN", formula)
-        self.assertIn("TOP_ORG_PATTERN", formula)
+        # Fix 10: the alias patterns are the helper CELLS, never a named range.
+        self.assertIn("'Grade Rules'!$G$2", formula)
+        self.assertIn("'Grade Rules'!$G$3", formula)
+        self.assertNotIn("TOP_UNIV_PATTERN", formula)
+        self.assertNotIn("TOP_ORG_PATTERN", formula)
         self.assertIn("'Grade Rules'!", formula)
         self.assertNotIn("'Master Top University'!", formula)
         self.assertNotIn("'Master Top Organizer'!", formula)
 
-    def test_d2_references_the_named_ranges_instead_of_inlining_the_pattern(self):
+    def test_d2_references_the_helper_cells_instead_of_inlining_the_pattern(self):
         """One generated cell per pattern keeps D2 much smaller than the inlined version."""
         formula = GRADE_ARRAYFORMULA_D2
         # FILTER( stays in D2 only for the grade lookup (`FILTER('Grade Rules'!B$2:B, ...)`).
@@ -81,14 +137,41 @@ class TestGradeFormula(unittest.TestCase):
         self.assertLess(len(formula), len(inlined) * 0.7,
                         f"D2 is {len(formula)} chars, inlined {len(inlined)}")
 
-        # Each named range really holds the compiled pattern: three rule branches use the
+        # Each helper cell really holds the compiled pattern: three rule branches use the
         # university pattern (twice per branch: Universitas + Penyelenggara), three use the
         # organizer pattern (once each).
-        self.assertEqual(formula.count("TOP_UNIV_PATTERN"), 6)
-        self.assertEqual(formula.count("TOP_ORG_PATTERN"), 3)
+        self.assertEqual(formula.count("'Grade Rules'!$G$2"), 6)
+        self.assertEqual(formula.count("'Grade Rules'!$G$3"), 3)
         for name, pattern_formula in GRADE_PATTERN_HELPER_FORMULAS.items():
             self.assertTrue(pattern_formula.startswith("="), name)
             self.assertGreater(len(pattern_formula), 400, name)
+
+    def test_no_regexmatch_result_is_compared_with_a_number(self):
+        """Fix 10: `REGEXMATCH(...)>0` is always TRUE in Sheets, so it must never be generated."""
+        for label, formula in [("D2", GRADE_ARRAYFORMULA_D2),
+                               *GRADE_PATTERN_HELPER_FORMULAS.items()]:
+            with self.subTest(formula=label):
+                self.assertEqual(regexmatch_compared_with_a_number(formula), [], label)
+
+    def test_top_organizer_branch_uses_the_boolean_directly(self):
+        """The exact owner-reported bug: BINUS/BINUS must not count as Top Organizer."""
+        formula = GRADE_ARRAYFORMULA_D2
+        self.assertIn("'Grade Rules'!$G$3))", formula)
+        self.assertNotIn("'Grade Rules'!$G$3)>0", formula)
+        # The university branch is a SUM of two REGEXMATCH results, which is numeric.
+        self.assertIn("((REGEXMATCH((\" \"&", formula)
+
+    def test_ifs_conditions_are_numeric_not_bare_booleans(self):
+        """A bare boolean mixed with numbers in IFS is the class of bug Fix 10 removes."""
+        conditions = ifs_conditions(GRADE_ARRAYFORMULA_D2)
+        self.assertGreater(len(conditions), len(INITIAL_SHEETS_DATA["Grade Rules"]["rows"]))
+        for condition in conditions:
+            with self.subTest(condition=condition[:60]):
+                self.assertTrue(
+                    condition == "TRUE" or "*" in condition or ">0" in condition
+                    or "=0" in condition,
+                    f"IFS condition is a bare boolean/number: {condition[:120]}",
+                )
 
     def test_empty_aliases_are_filtered_out(self):
         """The old bug joined empty cells into `\\b\\b`, which matched every row."""
@@ -207,7 +290,7 @@ class TestPopulateTemplate(unittest.TestCase):
         self.assertEqual(client.spreadsheet.worksheet("Competition Report").data[1][3],
                          "=MY_OWN_FORMULA()")
 
-    def test_grade_pattern_helpers_and_named_ranges_are_installed(self):
+    def test_grade_pattern_helpers_are_installed_and_referenced_by_d2(self):
         client = FakeClient(empty=True)
         populate_template(client, "sheet_id")
 
@@ -218,21 +301,18 @@ class TestPopulateTemplate(unittest.TestCase):
         self.assertEqual(grade_ws.data[2][5], "TOP_ORG_PATTERN")
         self.assertEqual(grade_ws.data[2][6], GRADE_PATTERN_HELPER_FORMULAS["TOP_ORG_PATTERN"])
 
-        names = sorted(client.spreadsheet.named_ranges)
-        self.assertEqual(names, ["TOP_ORG_PATTERN", "TOP_UNIV_PATTERN"])
-        univ = client.spreadsheet.named_ranges["TOP_UNIV_PATTERN"]["range"]
-        self.assertEqual(univ["sheetId"], grade_ws.id)
-        self.assertEqual((univ["startRowIndex"], univ["endRowIndex"]), (1, 2))
-        self.assertEqual((univ["startColumnIndex"], univ["endColumnIndex"]), (6, 7))
-        org = client.spreadsheet.named_ranges["TOP_ORG_PATTERN"]["range"]
-        self.assertEqual((org["startRowIndex"], org["endRowIndex"]), (2, 3))
+        # Fix 10: no named range is created; D2 points straight at the helper cells.
+        self.assertEqual(client.spreadsheet.named_ranges, {})
+        comp_ws = client.spreadsheet.worksheet("Competition Report")
+        d2 = comp_ws.data[1][3]
+        self.assertIn("'Grade Rules'!$G$2", d2)
+        self.assertIn("'Grade Rules'!$G$3", d2)
 
     def test_grade_pattern_helpers_are_idempotent_and_never_overwrite_admin_text(self):
         client = FakeClient(empty=True)
         populate_template(client, "sheet_id")
         populate_template(client, "sheet_id")
 
-        self.assertEqual(len(client.spreadsheet.named_ranges), 2, "re-running must not duplicate them")
         grade_ws = client.spreadsheet.worksheet("Grade Rules")
         self.assertEqual(grade_ws.data[1][5], "TOP_UNIV_PATTERN")
 
@@ -241,46 +321,31 @@ class TestPopulateTemplate(unittest.TestCase):
         populate_template(client, "sheet_id")
         self.assertEqual(grade_ws.data[1][6], "=MY_OWN_PATTERN()")
 
-    def test_d2_is_not_written_when_the_named_ranges_cannot_be_created(self):
-        """addNamedRange rejected -> keep D2 empty, warn once, never fill the column with #NAME?."""
+    def test_d2_is_installed_even_when_named_ranges_cannot_be_created(self):
+        """Fix 10: D2 no longer depends on named ranges, so a rejected addNamedRange is harmless."""
         client = FakeClient(empty=True)
         client.spreadsheet.named_range_error = (
             "403 PERMISSION_DENIED: The caller does not have permission"
         )
 
-        with self.assertLogs("templates.build_template", level="WARNING") as logs:
-            populate_template(client, "sheet_id")
-
-        comp_ws = client.spreadsheet.worksheet("Competition Report")
-        values = comp_ws.get_all_values()
-        self.assertEqual(values[0][3], "Grade Lomba", "the header may still be written")
-        d2 = values[1][3] if len(values) > 1 and len(values[1]) > 3 else ""
-        self.assertEqual(d2, "", "D2 must stay empty when its named ranges are missing")
-        self.assertNotIn("TOP_UNIV_PATTERN", str(values))
-
-        # Exactly one warning about D2, and it is actionable.
-        d2_warnings = [r.getMessage() for r in logs.records
-                       if r.levelname == "WARNING" and "D2 was left untouched" in r.getMessage()]
-        self.assertEqual(len(d2_warnings), 1, [r.getMessage() for r in logs.records])
-        for expected in ("TOP_UNIV_PATTERN", "TOP_ORG_PATTERN", "#NAME?", "re-run this cell"):
-            self.assertIn(expected, d2_warnings[0])
-
-    def test_d2_is_installed_on_the_next_run_once_the_named_ranges_exist(self):
-        client = FakeClient(empty=True)
-        client.spreadsheet.named_range_error = "503 Service Unavailable backend error"
         populate_template(client, "sheet_id")
 
         comp_ws = client.spreadsheet.worksheet("Competition Report")
-        values = comp_ws.get_all_values()
-        d2 = values[1][3] if len(values) > 1 and len(values[1]) > 3 else ""
-        self.assertEqual(d2, "")
-
-        client.spreadsheet.named_range_error = None
-        populate_template(client, "sheet_id")
-        values = comp_ws.get_all_values()
-        d2 = values[1][3] if len(values) > 1 and len(values[1]) > 3 else ""
+        self.assertEqual(comp_ws.data[0][3], "Grade Lomba")
+        d2 = comp_ws.data[1][3]
         self.assertTrue(d2.startswith("=ARRAYFORMULA(IFS("), d2[:80])
-        self.assertIn("TOP_UNIV_PATTERN", d2)
+        self.assertIn("'Grade Rules'!$G$2", d2)
+        self.assertEqual(client.spreadsheet.named_ranges, {})
+
+    def test_d2_is_written_once_and_then_left_alone(self):
+        client = FakeClient(empty=True)
+        populate_template(client, "sheet_id")
+        comp_ws = client.spreadsheet.worksheet("Competition Report")
+        first = comp_ws.data[1][3]
+
+        populate_template(client, "sheet_id")
+
+        self.assertEqual(comp_ws.data[1][3], first)
 
     def test_protected_ranges_are_full_sheet_and_not_duplicated(self):
         client = FakeClient(empty=True)

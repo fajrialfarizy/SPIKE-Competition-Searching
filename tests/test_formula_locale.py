@@ -270,6 +270,27 @@ class TestPopulateTemplateIdempotency(PopulateLocaleTestCase):
 
         self.assertEqual(cell(grade_ws, 2, 6), "=MY_OWN_PATTERN()")
 
+    def test_legacy_named_range_formula_is_recognised_and_refreshed(self):
+        """Fix 10: the previous generator's named-range formula is ours, so it gets repaired."""
+        client = self.build(locale="en_US")
+        populate_template(client, "sheet_id")
+        comp_ws = client.spreadsheet.worksheet("Competition Report")
+        legacy = (GRADE_ARRAYFORMULA_D2
+                  .replace("'Grade Rules'!$G$2", "TOP_UNIV_PATTERN")
+                  .replace("'Grade Rules'!$G$3", "TOP_ORG_PATTERN"))
+        comp_ws.data[1][3] = legacy
+        writes_before = len(comp_ws.writes)
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            populate_template(client, "sheet_id")
+
+        refreshed = cell(comp_ws, 2, 3)
+        self.assertIn("'Grade Rules'!$G$2", refreshed)
+        self.assertNotIn("TOP_UNIV_PATTERN", refreshed)
+        self.assertIn("D2", [w["target"] for w in comp_ws.writes[writes_before:]])
+        self.assertIn("disegarkan", out.getvalue())
+
     def test_existing_comma_formula_is_repaired_for_the_new_locale(self):
         """An already broken (comma) helper formula is rewritten with ';', not left broken."""
         client = self.build(locale="en_US", engine=None)
@@ -285,6 +306,78 @@ class TestPopulateTemplateIdempotency(PopulateLocaleTestCase):
         repaired = cell(grade_ws, 2, 6)
         self.assertEqual(commas_outside_strings(repaired), 0)
         self.assertIn(";", repaired)
+
+
+class TestD2InstallationAndStatus(PopulateLocaleTestCase):
+    """Fix 10: D2 is installed on a blank sheet and the run always prints a clear status."""
+
+    def test_blank_spreadsheet_gets_the_localized_d2_formula(self):
+        client = self.build(locale="id_ID", engine=comma_formula_engine)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            populate_template(client, "sheet_id")
+
+        comp_ws = client.spreadsheet.worksheet("Competition Report")
+        d2 = cell(comp_ws, 2, 3)
+        self.assertTrue(d2.startswith("=ARRAYFORMULA(IFS("), d2[:80])
+        self.assertEqual(commas_outside_strings(d2), 0, d2[:160])
+        self.assertIn("'Grade Rules'!$G$2", d2)
+        self.assertIn("'Grade Rules'!$G$3", d2)
+        self.assertTrue(d2.endswith(")"), d2[-40:])
+
+        status = out.getvalue()
+        self.assertIn("STATUS TEMPLATE", status)
+        self.assertIn("Grade Rules!G2: ok", status)
+        self.assertIn("Grade Rules!G3: ok", status)
+        self.assertIn("Competition Report!D2: terpasang", status)
+        self.assertIn("id_ID", status)
+        self.assertIn("';'", status)
+
+    def test_rerun_reports_the_generated_d2_as_unchanged(self):
+        client = self.build(locale="id_ID", engine=comma_formula_engine)
+        populate_template(client, "sheet_id")
+        comp_ws = client.spreadsheet.worksheet("Competition Report")
+        first = cell(comp_ws, 2, 3)
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            populate_template(client, "sheet_id")
+
+        self.assertEqual(cell(comp_ws, 2, 3), first)
+        status = out.getvalue()
+        self.assertIn("Competition Report!D2: tidak diubah (sudah berisi formula sistem", status)
+        self.assertNotIn("terpasang", status)
+
+    def test_custom_d2_is_left_untouched_with_a_visible_message(self):
+        client = self.build(locale="en_US")
+        populate_template(client, "sheet_id")
+        comp_ws = client.spreadsheet.worksheet("Competition Report")
+        comp_ws.data[1][3] = "=ARRAYFORMULA(IFS(A2:A=\"x\",\"Custom\"))"
+        writes_before = len(comp_ws.writes)
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            populate_template(client, "sheet_id")
+
+        self.assertEqual(cell(comp_ws, 2, 3), "=ARRAYFORMULA(IFS(A2:A=\"x\",\"Custom\"))")
+        self.assertNotIn("D2", [w["target"] for w in comp_ws.writes[writes_before:]])
+        status = out.getvalue()
+        self.assertIn("Competition Report!D2: tidak diubah", status)
+        self.assertIn("buatan admin", status)
+
+    def test_helper_error_still_prints_the_status_table_before_raising(self):
+        client = self.build(locale="id_ID", engine=always_error_engine)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            with self.assertRaises(FormulaLocaleError):
+                populate_template(client, "sheet_id")
+
+        status = out.getvalue()
+        self.assertIn("Grade Rules!G2: error", status)
+        self.assertIn("Grade Rules!G3: error", status)
+        self.assertIn("Competition Report!D2: tidak diubah (sel bantu G2:G3 error)", status)
+        comp_ws = client.spreadsheet.worksheet("Competition Report")
+        self.assertEqual(cell(comp_ws, 2, 3), "")
 
 
 if __name__ == "__main__":

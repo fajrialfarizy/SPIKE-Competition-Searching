@@ -129,7 +129,21 @@ MULTI_ALIAS_ROWS = [
     _extra_row("unknown_mode", "BEM UI", "", "Nasional", "TBD", "Unknown"),
 ]
 
-TEST_ROWS = build_matrix() + MULTI_ALIAS_ROWS
+# Fix 10: the owner's real sheet graded BINUS/BINUS as Professional because the sheet
+# formula compared a BOOLEAN REGEXMATCH result with 0 (`FALSE>0` is TRUE in Google Sheets),
+# so every row counted as Top Organizer. These rows use names that are in NEITHER master
+# list, so no entity rule may match: Nasional must stay Beginner and Internasional
+# Intermediate, whatever the mode.
+UNRELATED_NAMES = [
+    _extra_row(
+        f"unrelated_{skala.lower()}_{mode.lower()}", "BINUS", "BINUS", skala, mode,
+        "Intermediate" if skala == "Internasional" else "Beginner",
+    )
+    for skala in ("Nasional", "Internasional")
+    for mode in ("Online", "Offline", "Hybrid")
+]
+
+TEST_ROWS = build_matrix() + MULTI_ALIAS_ROWS + UNRELATED_NAMES
 
 
 class TestOracleMatchesPrdTable(unittest.TestCase):
@@ -154,8 +168,27 @@ class TestOracleMatchesPrdTable(unittest.TestCase):
     def test_matrix_covers_every_combination(self):
         self.assertEqual(
             len(TEST_ROWS),
-            len(ENTITIES) * len(SKALAS) * len(MODES) * len(MISSING) + len(MULTI_ALIAS_ROWS),
+            len(ENTITIES) * len(SKALAS) * len(MODES) * len(MISSING)
+            + len(MULTI_ALIAS_ROWS) + len(UNRELATED_NAMES),
         )
+
+    def test_unrelated_names_are_never_top_organizer_or_top_university(self):
+        """Fix 10 regression: BINUS/BINUS is not in any master list (owner-reported bug)."""
+        self.assertEqual(len(UNRELATED_NAMES), 6)
+        expected_by_skala = {"Nasional": "Beginner", "Internasional": "Intermediate"}
+        for row in UNRELATED_NAMES:
+            with self.subTest(skala=row["skala"], mode=row["pelaksanaan_final"]):
+                self.assertEqual(row["expected"], expected_by_skala[row["skala"]])
+                grade = calculate_grade(
+                    penyelenggara=row["penyelenggara"],
+                    skala=row["skala"],
+                    pelaksanaan_final=row["pelaksanaan_final"],
+                    universitas=row["universitas"],
+                    top_universities=TOP_UNIVERSITIES,
+                    top_organizers=TOP_ORGANIZERS,
+                )
+                self.assertEqual(grade, row["expected"])
+                self.assertNotIn(grade, ("Professional", "Advance"))
 
     def test_multiple_aliases_punctuation_and_empty_alias(self):
         """The oracle splits aliases the same way the master sheets and the formula do."""
